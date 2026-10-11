@@ -54,6 +54,7 @@ from typing import Union, Any, Callable, Dict, List, Optional, TYPE_CHECKING
 if TYPE_CHECKING:
     from utilities.llm import PhaseBinding
     from context.application_context import ApplicationContext  # noqa: F401
+from utilities.llm_client import unpriced_kinds_from
 from utilities.rate_limiter import is_budget_exhausted_error
 
 
@@ -557,6 +558,11 @@ def analyze_reachability(
             if t.get("cost_incomplete"):
                 u["cost_incomplete"] = True
                 u["unpriced_models"] = t.get("unpriced_models") or []
+                # #626/PR#661 hunt F4: the cache kind travels under its own
+                # key, present-only (the #216 list stays unconditional here
+                # — its shape is the pre-#626 contract this block ships).
+                if t.get("unpriced_cache_models"):
+                    u["unpriced_cache_models"] = t["unpriced_cache_models"]
             if t.get("accounting_errors"):
                 u["accounting_errors"] = t.get("accounting_errors")
             return u
@@ -664,14 +670,23 @@ def analyze_reachability(
                               for r in adopted.values())
                 tot_cost = sum(float((r.get("usage") or {}).get("cost_usd", 0) or 0)
                                for r in adopted.values())
+                # #216 + #626/PR#661 hunt F4: BOTH kinds. _share() has
+                # persisted ``unpriced_cache_models`` into the adopted
+                # records since F661-2, but this — the only reader on the
+                # restore side — ignored it: write-only persistence. A
+                # resumed LLR pass therefore read a complete cost after
+                # cache-unpriced spend.
                 unpriced: set = set()
+                unpriced_cache: set = set()
                 for r in adopted.values():
-                    unpriced.update(
-                        (r.get("usage") or {}).get("unpriced_models") or [])
+                    _u, _c = unpriced_kinds_from(r.get("usage"))
+                    unpriced.update(_u)
+                    unpriced_cache.update(_c)
                 try:
                     tracker.add_prior_usage(
                         tot_in, tot_out, tot_cost,
-                        unpriced_models=sorted(unpriced) or None)
+                        unpriced_models=sorted(unpriced) or None,
+                        unpriced_cache_models=sorted(unpriced_cache) or None)
                 except Exception:  # noqa: BLE001 — accounting must never kill the pass
                     pass
 
@@ -948,10 +963,13 @@ def analyze_reachability(
                 # interchangeable — unpriced_models means the model had no
                 # pricing record (the figure OMITS that spend, a lower
                 # bound); unpriced_cache_models means the model is priced
-                # but its cache multipliers are absent, so cached traffic
-                # billed at the full input rate (an UPPER bound). Merging
-                # them would assert a false statement about a priced model
-                # in the persisted record and in the next resume's input.
+                # but its cache multipliers are absent. Merging them would
+                # assert a false statement about a priced model in the
+                # persisted record and in the next resume's input.
+                # PR#661 hunt F1: no direction is claimed for the cache kind
+                # — it is opposite for the exclusive and inclusive provider
+                # field shapes (see
+                # utilities.llm_client.PricedUsage.unpriced_cache).
                 if batch_usage.get("unpriced_models"):
                     share["cost_incomplete"] = True
                     share["unpriced_models"] = sorted(

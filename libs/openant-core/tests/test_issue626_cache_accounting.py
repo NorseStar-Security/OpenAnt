@@ -612,7 +612,7 @@ def test_llr_checkpoint_record_keeps_cache_incompleteness_loud(tmp_path):
                     "unpriced_cache_models": ["gpt-4o"]}
 
         def add_prior_usage(self, input_tokens, output_tokens, cost_usd,
-                            unpriced_models=None):
+                            unpriced_models=None, **kw):
             pass
 
     cp = str(tmp_path / "llm_reach_checkpoints")
@@ -864,3 +864,390 @@ def test_summary_path_tracker_and_report_result_agree():
             == info.unpriced_cache_models == ["gpt-4o"])
     assert (totals.get("total_cache_read_tokens")
             == info.total_cache_read_tokens == 4_096)
+
+
+# ---------------------------------------------------------------------------
+# HUNT ROUND 1 — the fix stage (F1/F2/F3/F4/F5/L1)
+#
+# F1: the shipped label called an unpriced-cache figure an UPPER bound in
+#     every surface. That is true ONLY for the INCLUSIVE field shapes
+#     (openai ``cached_tokens`` / google ``cached_content_token_count``,
+#     which sit INSIDE the provider's input count, so an absent multiplier
+#     bills them at the FULL input rate = an over-estimate). For the
+#     EXCLUSIVE shapes (anthropic/bedrock ``cache_read_input_tokens`` /
+#     ``cache_creation_input_tokens``, DISJOINT from input_tokens) an absent
+#     multiplier contributes $0 — the figure is a LOWER bound. The shipped
+#     census makes that the common case: 11/11 bedrock records are priced
+#     with no cache block, and the bedrock adapter DOES emit the exclusive
+#     fields (it imports anthropic.py's _response_to_unified).
+# F3: the scan-level aggregate dropped the cache kind's ids and the cache
+#     token deltas — "incomplete with no model named", the exact shape
+#     F661-2 fixed one hop upstream.
+# F4: the per-unit checkpoint carries the cache marker but every restore
+#     site read ``unpriced_models`` only, so a resumed run read COMPLETE.
+# F5: the #605 start-failed sentinel branch kept the #216 ids and dropped
+#     the cache ids.
+# ---------------------------------------------------------------------------
+
+_BEDROCK_SONNET = pricing_map("bedrock")["us.anthropic.claude-sonnet-4-6"]
+_GPT4O = pricing_map("openai")["gpt-4o"]
+
+
+def test_exclusive_unpriced_cache_underreports_and_inclusive_overreports():
+    """F1's executable oracle: the two shapes err in OPPOSITE directions, so
+    no single-direction label can be true of both.
+
+    EXCLUSIVE (bedrock, priced, no cache block — 11/11 of the shipped
+    bedrock census): the cached tokens are disjoint from input_tokens and
+    contribute $0 ⇒ the reported figure is BELOW the real bill (a LOWER
+    bound). INCLUSIVE (gpt-4o, priced, no cache block): the cached tokens
+    are already inside input_tokens and bill at the full input rate ⇒ the
+    reported figure is ABOVE the real bill (an UPPER bound).
+    """
+    from utilities.llm_client import normalize_cache_usage, price_usage
+
+    # --- exclusive: anthropic/bedrock ---
+    excl = price_usage(10_000, 1_000, _BEDROCK_SONNET,
+                       cache_counts=normalize_cache_usage(
+                           {"cache_read_input_tokens": 90_000}))
+    real_excl = ((10_000 / 1e6) * _BEDROCK_SONNET["input"]
+                 + (1_000 / 1e6) * _BEDROCK_SONNET["output"]
+                 + (90_000 / 1e6) * _BEDROCK_SONNET["input"] * 0.1)
+    assert excl.unpriced_cache is True
+    assert excl.cost_usd < real_excl, (
+        "the exclusive shape's unpriced cache tokens contribute $0 — the "
+        "figure CANNOT be an upper bound")
+    assert round(excl.cost_usd / real_excl, 3) == 0.625
+
+    # --- inclusive: openai ---
+    incl = price_usage(10_000, 1_000, _GPT4O,
+                       cache_counts=normalize_cache_usage(
+                           {"cached_tokens": 8_000}))
+    # the real bill if gpt-4o's documented 0.5x read multiplier were
+    # configured: the 8 000 cached tokens at half the input rate.
+    real_incl = ((2_000 / 1e6) * _GPT4O["input"]
+                 + (1_000 / 1e6) * _GPT4O["output"]
+                 + (8_000 / 1e6) * _GPT4O["input"] * 0.5)
+    assert incl.unpriced_cache is True
+    assert incl.cost_usd > real_incl, (
+        "the inclusive shape's unpriced cache tokens bill at the full input "
+        "rate — that direction IS an upper bound")
+
+
+def test_cache_kind_direction_is_documented_per_shape():
+    """F1: the ``unpriced_cache`` contract must state the direction PER
+    SHAPE. A blanket "the figure is an UPPER bound" is false for the
+    exclusive shapes (see the oracle above) and that sentence shipped in
+    PricedUsage's field doc, in start_unit_tracking and in get_unit_usage.
+    """
+    import inspect
+
+    from utilities import llm_client
+
+    src = inspect.getsource(llm_client)
+    field_doc = src.split("unpriced_cache: bool")[0].rsplit("#: a cache side", 1)[-1]
+    low = field_doc.lower()
+    assert "exclusive" in low and "inclusive" in low, (
+        "PricedUsage.unpriced_cache's doc must name the two field shapes — "
+        "the direction depends on them:\n" + field_doc)
+    assert "lower" in low, (
+        "the exclusive (anthropic/bedrock) direction — a LOWER bound — is "
+        "missing from the field doc:\n" + field_doc)
+
+    for fn in (llm_client.TokenTracker.start_unit_tracking,
+               llm_client.TokenTracker.get_unit_usage):
+        body = inspect.getsource(fn).lower()
+        if "bound" not in body:
+            continue
+        assert "exclusive" in body or "inclusive" in body, (
+            f"{fn.__qualname__} states a bound direction for the cache kind "
+            f"without naming the field shape that makes it true")
+
+
+# --- F3: the scan-level aggregate ------------------------------------------
+
+def _scan_agg(tmp_path, step_reports):
+    import json
+
+    from core.scanner import _write_scan_report
+    from core.schemas import AnalysisMetrics, ScanResult
+
+    metrics = AnalysisMetrics(total=0, vulnerable=0, bypassable=0,
+                              inconclusive=0, protected=0, safe=0, errors=0)
+    result = ScanResult(output_dir=str(tmp_path), units_count=0,
+                        language="python", metrics=metrics)
+    path = _write_scan_report(str(tmp_path), result, step_reports,
+                              repo_path=str(tmp_path / "repo"))
+    return json.loads(Path(path).read_text())["token_usage"]
+
+
+def test_scan_report_aggregate_names_the_cache_unpriced_models(tmp_path):
+    """F3: a cache-only-incomplete scan must NOT ship
+    {cost_incomplete: true, unpriced_models: []} — an un-attributable
+    incomplete is the shape F661-2 deleted at the step hop."""
+    tu = _scan_agg(tmp_path, [
+        {"step": "verify", "cost_usd": 0.0495, "duration_seconds": 1.0,
+         "token_usage": {
+             "input_tokens": 10_000, "output_tokens": 1_000,
+             "total_tokens": 11_000, "cache_read": 90_000,
+             "cost_incomplete": True, "unpriced_models": [],
+             "unpriced_cache_models": ["us.anthropic.claude-sonnet-4-6"]}},
+    ])
+    assert tu["cost_incomplete"] is True
+    assert tu["unpriced_cache_models"] == ["us.anthropic.claude-sonnet-4-6"]
+    assert tu["unpriced_models"] == []
+
+
+def test_scan_report_aggregate_carries_the_cache_token_deltas(tmp_path):
+    """F3: the cache line items are real traffic — the aggregate rebuilt
+    token_usage from the step reports and dropped them, so the operator's
+    artifact showed 11 000 tokens for a 101 000-token step."""
+    tu = _scan_agg(tmp_path, [
+        {"step": "analyze", "cost_usd": 0.01, "duration_seconds": 1.0,
+         "token_usage": {"input_tokens": 100, "output_tokens": 10,
+                         "total_tokens": 110, "cache_read": 90_000,
+                         "cache_write": 1_000}},
+        {"step": "verify", "cost_usd": 0.01, "duration_seconds": 1.0,
+         "token_usage": {"input_tokens": 100, "output_tokens": 10,
+                         "total_tokens": 110, "cache_read": 5_000}},
+    ])
+    assert tu["cache_read"] == 95_000
+    assert tu["cache_write"] == 1_000
+    # input/output/total stay the uncached line items (the #626 split —
+    # cache is NEVER folded into total_input_tokens anywhere).
+    assert tu["total_tokens"] == 220
+
+
+def test_scan_report_aggregate_byte_identical_without_cache(tmp_path):
+    """F3's guard: a no-cache scan's aggregate must gain NO new keys."""
+    tu = _scan_agg(tmp_path, [
+        {"step": "parse", "cost_usd": 0.1, "duration_seconds": 1.0,
+         "token_usage": {"input_tokens": 5, "output_tokens": 5,
+                         "total_tokens": 10}}])
+    assert set(tu) == {"input_tokens", "output_tokens", "total_tokens"}
+
+
+# --- F5: the #605 start-failed sentinel branch -----------------------------
+
+def test_step_report_sentinel_branch_keeps_the_cache_unpriced_ids(tmp_path):
+    """F5: when the START snapshot failed, the delta is unavailable but the
+    WHICH-MODEL disclosure is not. The branch kept ``unpriced_models`` and
+    dropped ``unpriced_cache_models`` — F661-2 applied to one branch only."""
+    import json
+
+    import core.step_report as sr
+    from utilities.llm_client import get_global_tracker
+
+    tracker = get_global_tracker()
+    tracker.reset()
+    real = sr._snapshot_usage
+    seen = {"n": 0}
+
+    def _fake():
+        seen["n"] += 1
+        if seen["n"] == 1:
+            return (None, None)          # the #605 start-failed sentinel
+        return real()
+
+    sr._snapshot_usage = _fake
+    try:
+        with sr.step_context("verify", str(tmp_path)):
+            tracker.record_call(
+                model="us.anthropic.claude-sonnet-4-6",
+                input_tokens=10_000, output_tokens=1_000,
+                pricing=_BEDROCK_SONNET,
+                usage_details={"cache_read_input_tokens": 90_000})
+    finally:
+        sr._snapshot_usage = real
+        tracker.reset()
+
+    tu = json.loads(
+        (tmp_path / "verify.report.json").read_text())["token_usage"]
+    assert tu["accounting_error"] is True
+    assert tu["cost_incomplete"] is True
+    assert tu["unpriced_cache_models"] == ["us.anthropic.claude-sonnet-4-6"]
+
+
+# --- F4: the resume / summary layer ---------------------------------------
+
+def test_add_prior_usage_restores_the_cache_incompleteness_marker():
+    """F4's core: run 1's per-unit checkpoint carries the cache marker;
+    ``add_prior_usage`` had nowhere to put it, so run 2 read COMPLETE."""
+    t1 = TokenTracker()
+    t1.start_unit_tracking()
+    t1.record_call(model="us.anthropic.claude-sonnet-4-6",
+                   input_tokens=10_000, output_tokens=1_000,
+                   pricing=_BEDROCK_SONNET,
+                   usage_details={"cache_read_input_tokens": 90_000})
+    ckpt = t1.get_unit_usage()
+    assert ckpt["unpriced_cache_models"] == ["us.anthropic.claude-sonnet-4-6"]
+
+    t2 = TokenTracker()
+    t2.add_prior_usage(
+        ckpt["input_tokens"], ckpt["output_tokens"], ckpt["cost_usd"],
+        unpriced_models=ckpt.get("unpriced_models") or None,
+        unpriced_cache_models=ckpt.get("unpriced_cache_models") or None)
+    totals = t2.get_totals()
+    assert totals["cost_incomplete"] is True, (
+        "a resumed run after cache-unpriced spend must not read complete")
+    assert totals["unpriced_cache_models"] == ["us.anthropic.claude-sonnet-4-6"]
+    # and the two kinds still never merge (F661-3)
+    assert totals["unpriced_models"] == []
+
+
+def test_add_prior_usage_cache_kind_is_sticky_across_two_injections():
+    """The #216 stickiness contract, extended to the cache kind."""
+    t = TokenTracker()
+    t.add_prior_usage(10, 1, 0.0, unpriced_cache_models=["bedrock/x"])
+    t.add_prior_usage(10, 1, 0.001)
+    totals = t.get_totals()
+    assert totals["cost_incomplete"] is True
+    assert totals["unpriced_cache_models"] == ["bedrock/x"]
+    assert totals["unpriced_models"] == []
+
+
+def test_incomplete_markers_is_the_one_two_kind_rule():
+    """F4's architectural half: the reason the F661-3 split made the drop
+    TOTAL is that ~20 readers each re-implemented "which keys carry
+    incompleteness". One helper now owns the rule (the #598 lesson:
+    a second copy of a rule is the bug class, not the bug)."""
+    from utilities.llm_client import incomplete_markers, unpriced_kinds_from
+
+    assert incomplete_markers() == {}
+    assert incomplete_markers([], []) == {}
+    assert incomplete_markers(["m"], None) == {
+        "cost_incomplete": True, "unpriced_models": ["m"]}
+    assert incomplete_markers(None, ["c"]) == {
+        "cost_incomplete": True, "unpriced_cache_models": ["c"]}
+    assert incomplete_markers(["m"], ["c"]) == {
+        "cost_incomplete": True, "unpriced_models": ["m"],
+        "unpriced_cache_models": ["c"]}
+    # sorted + de-duplicated, so two restore sites merging the same id agree
+    assert incomplete_markers(["b", "a", "b"], None)["unpriced_models"] == ["a", "b"]
+
+    # the symmetric reader — the ONE place that knows which keys to read
+    assert unpriced_kinds_from(None) == ([], [])
+    assert unpriced_kinds_from({}) == ([], [])
+    assert unpriced_kinds_from({"input_tokens": 1}) == ([], [])   # legacy
+    assert unpriced_kinds_from(
+        {"unpriced_models": ["m"], "unpriced_cache_models": ["c"]}
+    ) == (["m"], ["c"])
+
+
+def test_analyzer_seed_summary_carries_the_cache_kind():
+    """F4: analyzer._seed_summary is the resume seed for the analyze phase —
+    it read ``unpriced_models`` only, so the cache kind died at the seed."""
+    from core import analyzer
+
+    unit_usage = {"input_tokens": 10_000, "output_tokens": 1_000,
+                  "cost_usd": 0.0495, "cost_incomplete": True,
+                  "unpriced_cache_models": ["us.anthropic.claude-sonnet-4-6"]}
+    seed = analyzer._seed_summary(
+        {"u1": {"result": {"verdict": "ok"}, "usage": unit_usage}}, None, None)
+    assert seed["unpriced_cache_models"] == {"us.anthropic.claude-sonnet-4-6"}
+    assert seed["unpriced_models"] == set()
+
+
+def test_agent_result_metadata_carries_the_cache_kind():
+    """F4: the enhance agent's AgentResult had no cache slot, so the six
+    construction sites could only persist the #216 kind — every enhanced
+    dataset row for a cache-unpriced unit read complete."""
+    from utilities.agentic_enhancer.agent import AgentResult
+
+    r = AgentResult(
+        include_functions=[], usage_context="", security_classification="",
+        classification_reasoning="", confidence=0.0, iterations=1,
+        total_tokens=11_000, input_tokens=10_000, output_tokens=1_000,
+        cost_usd=0.0495,
+        unpriced_cache_models=["us.anthropic.claude-sonnet-4-6"])
+    meta = r.to_dict()["agent_metadata"]
+    assert meta["cost_incomplete"] is True
+    assert meta["unpriced_cache_models"] == ["us.anthropic.claude-sonnet-4-6"]
+    assert "unpriced_models" not in meta, (
+        "the two kinds must stay disjoint (F661-3)")
+
+
+def test_agent_result_without_either_kind_is_byte_identical():
+    """The present-only guard for the new AgentResult slot."""
+    from utilities.agentic_enhancer.agent import AgentResult
+
+    r = AgentResult(
+        include_functions=[], usage_context="", security_classification="",
+        classification_reasoning="", confidence=0.0, iterations=1,
+        total_tokens=3, input_tokens=2, output_tokens=1, cost_usd=0.001)
+    assert set(r.to_dict()["agent_metadata"]) == {
+        "iterations", "total_tokens", "input_tokens", "output_tokens",
+        "cost_usd"}
+
+
+def test_unit_unpriced_kinds_reads_both_thread_local_sets():
+    """F4: agent.py read ``unit_unpriced`` in six places with a defensive
+    getattr chain. One helper now reads BOTH sets, beside the method that
+    creates them, so a third kind is a one-line change."""
+    from utilities.llm_client import unit_unpriced_kinds
+
+    t = TokenTracker()
+    # before start_unit_tracking: both absent, present-only ⇒ both None
+    assert unit_unpriced_kinds(t) == {"unpriced_models": None,
+                                      "unpriced_cache_models": None}
+    # a stub tracker with no thread-local at all must not raise
+    assert unit_unpriced_kinds(object()) == {"unpriced_models": None,
+                                             "unpriced_cache_models": None}
+    t.start_unit_tracking()
+    t.record_call(model="us.anthropic.claude-sonnet-4-6", input_tokens=1,
+                  output_tokens=1, pricing=_BEDROCK_SONNET,
+                  usage_details={"cache_read_input_tokens": 10})
+    t.record_call(model="mystery", input_tokens=1, output_tokens=1)
+    assert unit_unpriced_kinds(t) == {
+        "unpriced_models": ["mystery"],
+        "unpriced_cache_models": ["us.anthropic.claude-sonnet-4-6"]}
+
+
+def test_every_resume_restore_site_reads_both_unpriced_kinds():
+    """F4's census — the finding was not one site but SEVEN, and the next
+    kind must not be able to repeat it. Every module that restores prior
+    usage into a tracker must read the cache kind too."""
+    import inspect
+
+    from core import analyzer, llm_reachability
+    from utilities import context_enhancer, finding_verifier
+    from utilities.agentic_enhancer import agent
+    from utilities.dynamic_tester import models as dt_models
+
+    import utilities.dynamic_tester as dynamic_tester
+
+    for mod in (analyzer, finding_verifier, context_enhancer, agent,
+                llm_reachability, dynamic_tester, dt_models):
+        src = inspect.getsource(mod)
+        assert "unpriced_cache_models" in src, (
+            f"{mod.__name__} restores/persists the #216 kind but not the "
+            f"#626 cache kind — the F4 drop")
+
+    # and the restore CALLS pass it: every add_prior_usage call site must
+    # name the cache parameter (the slot existing is not the fix).
+    for mod in (analyzer, finding_verifier, context_enhancer,
+                llm_reachability, dynamic_tester):
+        src = inspect.getsource(mod)
+        for idx, chunk in enumerate(src.split("add_prior_usage(")[1:]):
+            head = chunk[:400]
+            assert "unpriced_cache_models" in head, (
+                f"{mod.__name__} add_prior_usage call #{idx + 1} does not "
+                f"restore the cache kind:\n{head}")
+
+
+def test_dynamic_test_result_persists_the_cache_kind():
+    """F4: the DT checkpoint record is a dataclass — the cache kind needed
+    its own field or the generation spend's attribution died on resume."""
+    from utilities.dynamic_tester.models import DynamicTestResult
+
+    import dataclasses
+    fields = {f.name for f in dataclasses.fields(DynamicTestResult)}
+    assert "unpriced_cache_models" in fields
+    r = DynamicTestResult(finding_id="VULN-001", status="PASS",
+                          details="")
+    # present-only: a no-cache row keeps the pre-#626 record shape (unlike
+    # its unconditional #598 sibling, which is the pre-existing contract)
+    assert "unpriced_cache_models" not in r.to_dict()
+    r.unpriced_cache_models = ["us.anthropic.claude-sonnet-4-6"]
+    assert r.to_dict()["unpriced_cache_models"] == [
+        "us.anthropic.claude-sonnet-4-6"]

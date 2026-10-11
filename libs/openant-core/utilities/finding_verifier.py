@@ -38,7 +38,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from .llm_client import TokenTracker, get_global_tracker
+from .llm_client import (TokenTracker, get_global_tracker,
+                         incomplete_markers, unpriced_kinds_from)
 from .llm import (
     LLMRateLimitError,
     Message,
@@ -816,6 +817,11 @@ class FindingVerifier:
         _summary_output_tokens = 0
         _summary_cost_usd = 0.0
         _summary_unpriced: set[str] = set()
+        # #626/PR#661 hunt F4: the cache kind's own set — the per-unit
+        # checkpoint carries ``unpriced_cache_models`` and this restore read
+        # ``unpriced_models`` only, so verify/_summary.json and the resume
+        # both reported a complete cost after cache-unpriced spend.
+        _summary_unpriced_cache: set[str] = set()
 
         # Sum usage from ALL existing checkpoints (including errored ones
         # — their cost was already spent in a prior run)
@@ -824,25 +830,30 @@ class FindingVerifier:
             _summary_input_tokens += _cp_usage.get("input_tokens", 0)
             _summary_output_tokens += _cp_usage.get("output_tokens", 0)
             _summary_cost_usd += _cp_usage.get("cost_usd", 0.0)
-            # #216: restore the incomplete-cost marker per unit.
-            _summary_unpriced.update(_cp_usage.get("unpriced_models") or [])
+            # #216 + #626: restore BOTH incomplete-cost kinds per unit,
+            # through the one reader that knows which keys carry them.
+            _u, _c = unpriced_kinds_from(_cp_usage)
+            _summary_unpriced.update(_u)
+            _summary_unpriced_cache.update(_c)
 
         def _usage_dict():
             usage = {"input_tokens": _summary_input_tokens,
                      "output_tokens": _summary_output_tokens,
                      "cost_usd": round(_summary_cost_usd, 6)}
-            # #216: persist the unpriced set into _summary.json (mirrors
-            # analyzer's — a resume-of-resume keeps the marker).
-            if _summary_unpriced:
-                usage["cost_incomplete"] = True
-                usage["unpriced_models"] = sorted(_summary_unpriced)
+            # #216 + #626: persist both unpriced kinds into _summary.json
+            # (mirrors analyzer's — a resume-of-resume keeps the markers),
+            # each under its own key and present-only.
+            usage.update(incomplete_markers(_summary_unpriced,
+                                            _summary_unpriced_cache))
             return usage
 
         # Inject prior usage into tracker so step_report captures the total
-        if _summary_input_tokens or _summary_output_tokens or _summary_unpriced:
+        if (_summary_input_tokens or _summary_output_tokens
+                or _summary_unpriced or _summary_unpriced_cache):
             self.tracker.add_prior_usage(
                 _summary_input_tokens, _summary_output_tokens, _summary_cost_usd,
-                unpriced_models=sorted(_summary_unpriced) or None)
+                unpriced_models=sorted(_summary_unpriced) or None,
+                unpriced_cache_models=sorted(_summary_unpriced_cache) or None)
             # #281: refresh the caller's phase baseline AFTER the injection
             # so its "Stage 2" delta excludes the restored usage.
             if phase_baseline is not None:

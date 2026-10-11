@@ -1312,9 +1312,12 @@ def _usage_to_info(usage: dict):
         # so ReportResult.usage always read 0/0/[] while the tracker's
         # totals (-> scan.report.json) carried the real figures — one scan
         # shipping two different answers. unpriced_cache_models stays its
-        # OWN list: a PRICED model whose cached traffic fell back to the
-        # full input rate (an upper bound) is not a model with no pricing
-        # record (a lower bound).
+        # OWN list: a PRICED model whose cache multipliers are missing is
+        # not a model with no pricing record at all (whose spend is omitted
+        # outright — a lower bound). PR#661 hunt F1: the cache kind's error
+        # DIRECTION is opposite for the exclusive and inclusive field
+        # shapes, so none is asserted here (see
+        # utilities.llm_client.PricedUsage.unpriced_cache).
         total_cache_read_tokens=int(usage.get("cache_read_tokens") or 0),
         total_cache_write_tokens=int(usage.get("cache_write_tokens") or 0),
         unpriced_cache_models=list(usage.get("unpriced_cache_models") or []),

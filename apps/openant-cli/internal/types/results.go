@@ -161,10 +161,21 @@ type UsageInfo struct {
 	// round-trips to exactly the pre-#626 key set.
 	//
 	// UnpricedCacheModels is NOT interchangeable with UnpricedModels: the
-	// former is a PRICED model whose cache multipliers are absent (its
-	// cached traffic billed at the full input rate — an upper bound); the
+	// former is a PRICED model whose cache multipliers are absent, the
 	// latter has no pricing record at all (its spend attributed $0 — a
 	// lower bound). Never merge the two lists.
+	//
+	// PR#661 hunt F1: this doc used to add "(its cached traffic billed at
+	// the full input rate — an upper bound)". That holds only for the
+	// INCLUSIVE field shapes (openai cached_tokens, google
+	// cached_content_token_count), whose cached tokens are already inside
+	// the input count. For the EXCLUSIVE shapes (anthropic/bedrock
+	// cache_read_input_tokens, DISJOINT from input_tokens) an absent
+	// multiplier contributes $0 and the figure is a LOWER bound — and the
+	// whole shipped bedrock census (11/11 priced, no cache block, exclusive
+	// fields emitted) is in that case. These fields carry no
+	// inclusion-shape discriminator, so no consumer may assert a direction
+	// from them; see internal/output.renderCostBlock.
 	TotalCacheReadTokens  int      `json:"total_cache_read_tokens,omitempty"`
 	TotalCacheWriteTokens int      `json:"total_cache_write_tokens,omitempty"`
 	UnpricedCacheModels   []string `json:"unpriced_cache_models,omitempty"`

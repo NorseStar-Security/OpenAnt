@@ -84,9 +84,13 @@ def _extract_usage(
         # #626: the cache line items, PRESENT-ONLY (a no-cache call keeps
         # exactly the four pre-#626 keys). The cache-unpriced kind is its
         # OWN key and is never folded into unpriced_models: this model IS
-        # priced, and its cached traffic merely fell back to the full input
-        # rate (an upper bound), which is the opposite error direction from
-        # having no pricing record at all (a lower bound).
+        # priced, only its cache multipliers are missing, which is a
+        # different condition from having no pricing record at all.
+        # PR#661 hunt F1: do NOT state a direction for the cache kind here —
+        # it is opposite for the two field shapes (exclusive ⇒ the cached
+        # tokens contribute $0, a LOWER bound; inclusive ⇒ they bill at the
+        # full input rate, an UPPER bound). See
+        # utilities.llm_client.PricedUsage.unpriced_cache.
         if priced.cache_read_tokens:
             usage["cache_read_tokens"] = priced.cache_read_tokens
         if priced.cache_write_tokens:

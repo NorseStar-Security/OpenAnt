@@ -147,9 +147,27 @@ class PricedUsage(NamedTuple):
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
     #: a cache side was USED but its multiplier is absent from ``pricing`` —
-    #: that side fell back to the full input rate, so the figure is an UPPER
-    #: bound and the run is incomplete. NOT the same as an absent pricing
-    #: record (#216), which makes the figure a LOWER bound.
+    #: the run is incomplete. The DIRECTION the figure errs in depends on the
+    #: provider's field shape and is OPPOSITE for the two (PR#661 hunt F1 —
+    #: the round-1 label asserted "an UPPER bound" for both, which was false
+    #: for 11 of the 11 shipped bedrock records):
+    #:
+    #:   EXCLUSIVE shapes (anthropic/bedrock ``cache_read_input_tokens`` /
+    #:     ``cache_creation_input_tokens``) are DISJOINT from ``input_tokens``,
+    #:     so an absent multiplier contributes $0 — the figure is a **LOWER**
+    #:     bound. Executed: us.anthropic.claude-sonnet-4-6, 10k in / 1k out /
+    #:     90k cache-read → formula $0.049500 vs real $0.079200 (ratio 0.625).
+    #:   INCLUSIVE shapes (openai ``cached_tokens``, google
+    #:     ``cached_content_token_count``) are already INSIDE ``input_tokens``,
+    #:     so an absent multiplier bills them at the full input rate — the
+    #:     figure is an **UPPER** bound.
+    #:
+    #: Neither is the same as an absent pricing RECORD (#216), which omits the
+    #: spend entirely (also a lower bound, but of a priced-model-less kind).
+    #: No rendering surface may assert one direction for the cache kind: the
+    #: serialized envelope carries no inclusion-shape discriminator (see the
+    #: named follow-up in the PR body), so the operator-facing wording states
+    #: the condition and that the figure may be under- OR over-stated.
     unpriced_cache: bool = False
 
 
@@ -239,6 +257,89 @@ def price_usage(
         total_cost += cache_cost
     return PricedUsage(total_cost, counts.read_total, counts.write_total,
                        unpriced_side)
+
+
+# ---------------------------------------------------------------------------
+# The TWO-KIND incompleteness rule — ONE implementation (PR#661 hunt F4)
+#
+# There are two kinds of incomplete cost and they are NOT interchangeable:
+#
+#   unpriced_models        the model had NO pricing record (#216/#598). Its
+#                          spend is attributed $0, so the figure OMITS it.
+#   unpriced_cache_models  the model IS priced; only its cache multipliers
+#                          are absent (#626). Its error direction depends on
+#                          the provider's field shape — see
+#                          PricedUsage.unpriced_cache.
+#
+# Before this, ~20 call sites across 7 modules each re-implemented "which
+# keys carry incompleteness and when". That is why the F661-3 relabel — which
+# split the per-unit cache set out of ``unit_unpriced`` into its own
+# thread-local — made the cache kind vanish from every ``_summary.json``,
+# every resume seed and every enhanced dataset row at once: none of those
+# readers had been taught the new key, and nothing could tell them. The rule
+# now lives HERE, next to the code that creates the two sets, so a third kind
+# is a change to two functions instead of an archaeology exercise.
+#
+# Both are PRESENT-ONLY: no kind ⇒ no keys ⇒ a pre-#216 artifact shape.
+# ---------------------------------------------------------------------------
+
+
+def incomplete_markers(unpriced=None, unpriced_cache=None) -> dict:
+    """The incompleteness marker keys for a usage/summary dict.
+
+    Returns ``{}`` when neither kind is present (never a fabricated
+    ``cost_incomplete: False`` — absent means "nothing to disclose", and the
+    byte-identity contract for a clean run depends on the absence).
+
+    Accepts any iterables (sets, lists, None); emits SORTED, de-duplicated
+    lists so two restore sites that merged the same ids agree byte-for-byte.
+    """
+    _u = sorted(set(unpriced or ()))
+    _c = sorted(set(unpriced_cache or ()))
+    out: dict = {}
+    if _u or _c:
+        out["cost_incomplete"] = True
+    if _u:
+        out["unpriced_models"] = _u
+    if _c:
+        out["unpriced_cache_models"] = _c
+    return out
+
+
+def unpriced_kinds_from(usage) -> tuple[list[str], list[str]]:
+    """Read BOTH unpriced kinds out of a persisted usage/metadata dict.
+
+    The symmetric reader for ``incomplete_markers``: the ONE place that knows
+    which keys a checkpoint, a ``_summary.json`` or an ``agent_metadata``
+    block carries. Tolerates None / non-dict / a pre-#626 dict with neither
+    key (both lists empty) — every restore site reads legacy checkpoints.
+    """
+    if not isinstance(usage, dict):
+        return [], []
+    return (list(usage.get("unpriced_models") or []),
+            list(usage.get("unpriced_cache_models") or []))
+
+
+def unit_unpriced_kinds(tracker) -> dict:
+    """The current thread's per-unit unpriced ids, BOTH kinds, as kwargs.
+
+    Returned as ``{"unpriced_models": [...] | None,
+    "unpriced_cache_models": [...] | None}`` so a result-object construction
+    site can splat it; ``None`` keeps the per-field present-only rule.
+
+    Defensive by the same contract ``start_unit_tracking``'s callers rely on:
+    a tracker stub with no ``_thread_local``, or a thread that never called
+    ``start_unit_tracking``, yields both ``None`` rather than raising — the
+    enhance agent constructs results on worker threads and in tests with
+    tracker doubles.
+    """
+    tl = getattr(tracker, "_thread_local", None)
+    return {
+        "unpriced_models":
+            sorted(getattr(tl, "unit_unpriced", None) or ()) or None,
+        "unpriced_cache_models":
+            sorted(getattr(tl, "unit_unpriced_cache", None) or ()) or None,
+    }
 
 
 class TokenTracker:
@@ -471,7 +572,8 @@ class TokenTracker:
         return call_record
 
     def add_prior_usage(self, input_tokens: int, output_tokens: int, cost_usd: float,
-                        unpriced_models: list[str] | None = None):
+                        unpriced_models: list[str] | None = None,
+                        unpriced_cache_models: list[str] | None = None):
         """Inject usage from a prior run (e.g. restored checkpoints).
 
         This ensures step reports capture the total cost across all runs,
@@ -479,6 +581,24 @@ class TokenTracker:
         the #216 incomplete-cost marker across a resume (the tracker resets
         per process; without this, a resumed run's cost silently looks
         complete again).
+
+        ``unpriced_cache_models`` is the #626 kind's slot (PR#661 hunt F4).
+        It did not exist, so the per-unit checkpoint's cache marker — which
+        ``get_unit_usage`` has always written — had nowhere to go: run 1
+        persisted ``cost_incomplete: True`` with the model named and run 2's
+        tracker read ``cost_incomplete: False``. Both kinds are restored into
+        their OWN set; they must never merge (F661-3 — calling a priced model
+        "unpriced" in the resumed artifact is a false statement, and that
+        relabel is what made this drop total).
+
+        NOT restored here: the cache TOKEN ledger
+        (``total_cache_read_tokens`` / ``total_cache_write_tokens``). The
+        per-unit checkpoint shape has never carried it, so restoring it means
+        new checkpoint keys plus token parameters on this method — the pinned
+        F661-3-proper follow-up, deliberately out of this round. A resumed
+        run is therefore SILENT about cache token volume and CORRECT about
+        cache-cost incompleteness, which is the trust gate the harness keys
+        on.
         """
         with self._lock:
             self.total_input_tokens += input_tokens
@@ -486,6 +606,8 @@ class TokenTracker:
             self.total_cost_usd += cost_usd
             if unpriced_models:
                 self._unpriced_models.update(unpriced_models)
+            if unpriced_cache_models:
+                self._unpriced_cache_models.update(unpriced_cache_models)
 
     def start_unit_tracking(self):
         """Start tracking usage for the current unit on this thread.
@@ -506,8 +628,14 @@ class TokenTracker:
         #   unit_unpriced       — #216: no pricing record at all (cost $0,
         #                         the figure is a LOWER bound)
         #   unit_unpriced_cache — #626: pricing present, cache multipliers
-        #                         absent (cached traffic billed at the full
-        #                         input rate, the figure is an UPPER bound)
+        #                         absent. The error DIRECTION depends on the
+        #                         provider's field shape and is opposite for
+        #                         the two: the EXCLUSIVE shapes contribute $0
+        #                         (a LOWER bound), the INCLUSIVE shapes bill
+        #                         at the full input rate (an UPPER bound).
+        #                         See PricedUsage.unpriced_cache — a single
+        #                         direction must never be asserted for this
+        #                         kind (PR#661 hunt F1).
         tl.unit_unpriced: set[str] = set()
         tl.unit_unpriced_cache: set[str] = set()
 
@@ -523,19 +651,22 @@ class TokenTracker:
         # checkpoint record so a resume restores the incomplete-cost marker.
         # #626/F661-3: the cache kind is emitted under its OWN key. The two
         # must never merge: unpriced_models means "no pricing record at all"
-        # (the figure omits that spend), unpriced_cache_models means "priced,
-        # but the cached traffic fell back to the full input rate" (the
-        # figure is an upper bound). Both are present-only, so a unit with
-        # neither serializes to exactly the three pre-#216 keys and a legacy
-        # checkpoint reader sees no new keys.
-        unpriced = getattr(tl, "unit_unpriced", set())
-        unpriced_cache = getattr(tl, "unit_unpriced_cache", set())
-        if unpriced or unpriced_cache:
-            usage["cost_incomplete"] = True
-        if unpriced:
-            usage["unpriced_models"] = sorted(unpriced)
-        if unpriced_cache:
-            usage["unpriced_cache_models"] = sorted(unpriced_cache)
+        # (the figure omits that spend), unpriced_cache_models means "the
+        # model IS priced but its cache multipliers are absent" — whose error
+        # direction depends on the provider's field shape (exclusive ⇒ a
+        # lower bound, inclusive ⇒ an upper bound; see
+        # PricedUsage.unpriced_cache). Both markers are present-only, so a
+        # unit with neither serializes to exactly the three pre-#216 keys and
+        # a legacy checkpoint reader sees no new keys.
+        #
+        # PR#661 hunt F4: the marker keys are stamped by ``incomplete_markers``
+        # — the ONE implementation of the two-kind rule, shared with every
+        # phase's ``_usage_dict`` and every resume seed. The F661-3 split made
+        # the cache kind vanish below this hop precisely because ~20 readers
+        # each re-implemented "which keys carry incompleteness".
+        usage.update(incomplete_markers(
+            getattr(tl, "unit_unpriced", None),
+            getattr(tl, "unit_unpriced_cache", None)))
         return usage
 
     def get_summary(self) -> dict:

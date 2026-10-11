@@ -149,9 +149,22 @@ def step_context(step: str, output_dir: str, inputs: dict | None = None):
             # the delta is unavailable but the WHICH-MODEL disclosure is
             # not (a start-failed step carrying the run's only unpriced
             # spend must not lose the ids from the aggregate).
-            if end_snapshot and end_snapshot.get("unpriced_models"):
-                report.token_usage["unpriced_models"] = \
-                    end_snapshot["unpriced_models"]
+            #
+            # PR#661 hunt F5: BOTH kinds. F661-2 taught the healthy branch
+            # below about ``unpriced_cache_models`` and left this one behind,
+            # so a start-failed step whose only spend was cache-unpriced
+            # reported the incompleteness with no model named — the same
+            # un-attributable shape F661-2 existed to delete. The two ids
+            # lists stay separate (never merged into unpriced_models), and
+            # both are present-only: a healthy-accounting sentinel step keeps
+            # exactly the five keys above.
+            if end_snapshot:
+                if end_snapshot.get("unpriced_models"):
+                    report.token_usage["unpriced_models"] = \
+                        end_snapshot["unpriced_models"]
+                if end_snapshot.get("unpriced_cache_models"):
+                    report.token_usage["unpriced_cache_models"] = \
+                        end_snapshot["unpriced_cache_models"]
         else:
             report.cost_usd = round(end_cost - start_cost, 6)
             report.token_usage = {

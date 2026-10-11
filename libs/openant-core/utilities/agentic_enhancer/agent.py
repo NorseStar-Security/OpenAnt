@@ -17,7 +17,8 @@ from typing import Optional, Set, List
 
 from core.file_boundary import boundary_for_language
 from ..llm_client import (TokenTracker, get_global_tracker,
-                          record_accounting_error)
+                          incomplete_markers, record_accounting_error,
+                          unit_unpriced_kinds)
 from ..llm import (
     Message,
     PhaseBinding,
@@ -107,6 +108,14 @@ class AgentResult:
         output_tokens: int = 0,
         cost_usd: float = 0.0,
         unpriced_models: Optional[list] = None,
+        # #626/PR#661 hunt F4: the cache kind's own slot. AgentResult had
+        # only the #216 one, so the six construction sites below could not
+        # persist a cache-unpriced unit's attribution: every enhanced
+        # dataset row and every per-unit checkpoint for such a unit read
+        # COMPLETE. The F661-3 relabel is what made that total — before it,
+        # the cache ids were (wrongly) inside ``unit_unpriced`` and at least
+        # reached here.
+        unpriced_cache_models: Optional[list] = None,
         usage_details: Optional[list] = None,
         # #615: WHICH degenerate exit produced this incomplete — the four
         # exits differ in kind and remedy (three cheap model-behavior
@@ -130,6 +139,11 @@ class AgentResult:
         self.cost_usd = cost_usd
         # #216: this unit's unpriced models (incomplete-cost marker).
         self.unpriced_models = unpriced_models
+        # #626: this unit's cache-unpriced models — a DIFFERENT kind (the
+        # model IS priced; only its cache multipliers are absent). Never
+        # merged with the above: merging asserts a false statement about a
+        # priced model in the persisted row (F661-3).
+        self.unpriced_cache_models = unpriced_cache_models
         # #211 pass-through capture: per-turn detail dicts, verbatim.
         self.usage_details = usage_details
         self.exit_kind = exit_kind
@@ -151,10 +165,14 @@ class AgentResult:
                 "input_tokens": self.input_tokens,
                 "output_tokens": self.output_tokens,
                 "cost_usd": self.cost_usd,
-                # #216: the unit's unpriced models — flows into the
-                # per-unit checkpoint record so resume restores the marker.
-                **({"cost_incomplete": True, "unpriced_models": self.unpriced_models}
-                   if self.unpriced_models else {}),
+                # #216 + #626: the unit's unpriced models, BOTH kinds —
+                # flows into the per-unit checkpoint record so resume
+                # restores the markers. One rule, one place
+                # (utilities.llm_client.incomplete_markers), present-only:
+                # a unit with neither kind serializes to exactly the five
+                # pre-#216 agent_metadata keys.
+                **incomplete_markers(self.unpriced_models,
+                                     self.unpriced_cache_models),
                 # #211: verbatim when captured; never summed, never in cost.
                 **({"usage_details": self.usage_details}
                    if self.usage_details is not None else {}),
@@ -321,7 +339,12 @@ class ContextAgent:
                 except Exception:
                     exc_in = exc_out = 0
                 attempt_cost = 0.0
-                attempt_unpriced = None
+                # #626/PR#661 hunt F4: the failed attempt's unpriced ids,
+                # BOTH kinds (replaces the single ``attempt_unpriced``).
+                # Pre-seeded here so the except-arm below — which must never
+                # raise over the original exception — reads a defined value.
+                attempt_kinds = {"unpriced_models": None,
+                                 "unpriced_cache_models": None}
                 if (total_input_tokens or total_output_tokens
                         or exc_in or exc_out):
                     # ENG-1 (#609 pre-code check): an accounting failure
@@ -347,9 +370,12 @@ class ContextAgent:
                         # guard, not turn into an AttributeError that
                         # replaces the original exception.
                         attempt_cost = call_record.get("cost_usd", 0.0)
-                        attempt_unpriced = sorted(getattr(
-                            getattr(self.tracker, "_thread_local", None),
-                            "unit_unpriced", set())) or None
+                        # #626/PR#661 hunt F4: BOTH kinds — agent_state is
+                        # the ONLY carrier of a failed attempt's spend
+                        # (agent_metadata is absent on error), so a cache
+                        # kind dropped here is dropped from the enhance
+                        # summary, the checkpoint and the resume at once.
+                        attempt_kinds = unit_unpriced_kinds(self.tracker)
                     except Exception:
                         # #609/#605: the swallowed accounting failure must be
                         # LOUD in the artifacts, not just stderr — tick the
@@ -394,8 +420,9 @@ class ContextAgent:
                     "input_tokens": total_input_tokens + exc_in,
                     "output_tokens": total_output_tokens + exc_out,
                     "cost_usd": attempt_cost,
-                    **({"unpriced_models": attempt_unpriced}
-                       if attempt_unpriced else {}),
+                    **incomplete_markers(
+                        attempt_kinds["unpriced_models"],
+                        attempt_kinds["unpriced_cache_models"]),
                 }
                 raise
 
@@ -444,9 +471,7 @@ class ContextAgent:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     cost_usd=call_record.get("cost_usd", 0.0),
-                    unpriced_models=sorted(getattr(
-                        getattr(self.tracker, "_thread_local", None),
-                        "unit_unpriced", set())) or None,
+                    **unit_unpriced_kinds(self.tracker),
                     usage_details=per_turn_usage_details,
                 )
 
@@ -521,9 +546,7 @@ class ContextAgent:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     cost_usd=call_record.get("cost_usd", 0.0),
-                    unpriced_models=sorted(getattr(
-                        getattr(self.tracker, "_thread_local", None),
-                        "unit_unpriced", set())) or None,
+                    **unit_unpriced_kinds(self.tracker),
                     usage_details=per_turn_usage_details,
                 )
 
@@ -553,9 +576,7 @@ class ContextAgent:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     cost_usd=call_record.get("cost_usd", 0.0),
-                    unpriced_models=sorted(getattr(
-                        getattr(self.tracker, "_thread_local", None),
-                        "unit_unpriced", set())) or None,
+                    **unit_unpriced_kinds(self.tracker),
                     usage_details=per_turn_usage_details,
                 )
 
@@ -597,9 +618,7 @@ class ContextAgent:
                     input_tokens=total_input_tokens,
                     output_tokens=total_output_tokens,
                     cost_usd=call_record.get("cost_usd", 0.0),
-                    unpriced_models=sorted(getattr(
-                        getattr(self.tracker, "_thread_local", None),
-                        "unit_unpriced", set())) or None,
+                    **unit_unpriced_kinds(self.tracker),
                     usage_details=per_turn_usage_details,
                 )
 
@@ -632,9 +651,7 @@ class ContextAgent:
             input_tokens=total_input_tokens,
             output_tokens=total_output_tokens,
             cost_usd=call_record.get("cost_usd", 0.0),
-            unpriced_models=sorted(getattr(
-                getattr(self.tracker, "_thread_local", None),
-                "unit_unpriced", set())) or None,
+            **unit_unpriced_kinds(self.tracker),
             usage_details=per_turn_usage_details,
         )
 
