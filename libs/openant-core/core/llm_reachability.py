@@ -943,10 +943,23 @@ def analyze_reachability(
                     "output_tokens": int(batch_usage.get("output_tokens", 0) or 0) // units_in_batch,
                     "cost_usd": round(float(batch_usage.get("cost_usd", 0.0) or 0.0) / units_in_batch, 6),
                 }
+                # #216 + #626/F661-3: BOTH incompleteness kinds travel,
+                # each under its own key and present-only. They are not
+                # interchangeable — unpriced_models means the model had no
+                # pricing record (the figure OMITS that spend, a lower
+                # bound); unpriced_cache_models means the model is priced
+                # but its cache multipliers are absent, so cached traffic
+                # billed at the full input rate (an UPPER bound). Merging
+                # them would assert a false statement about a priced model
+                # in the persisted record and in the next resume's input.
                 if batch_usage.get("unpriced_models"):
                     share["cost_incomplete"] = True
                     share["unpriced_models"] = sorted(
                         set(batch_usage["unpriced_models"]))
+                if batch_usage.get("unpriced_cache_models"):
+                    share["cost_incomplete"] = True
+                    share["unpriced_cache_models"] = sorted(
+                        set(batch_usage["unpriced_cache_models"]))
                 return share
 
             sig_by_unit: Dict[str, List[dict]] = {}

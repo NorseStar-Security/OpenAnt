@@ -64,37 +64,72 @@ func PrintKeyValue(key, value string) {
 	fmt.Println(value)
 }
 
-// renderCostBlock prints the Cost line (labelled incomplete when any model
-// was unpriced) and the unpriced id list — the one home for all three
-// summary renderers. #598: an incomplete figure must never read as
-// complete, and a $0 incomplete figure must not vanish the cost line
-// entirely (the report renderer's old cost>0 gate did exactly that).
+// stringIDs extracts the string ids from a decoded JSON list, skipping any
+// non-string element (the usage envelope arrives as map[string]any).
+func stringIDs(raw []any) []string {
+	ids := make([]string, 0, len(raw))
+	for _, u := range raw {
+		if id, ok := u.(string); ok {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+// renderCostBlock prints the Cost line and the incompleteness detail lines —
+// the one home for all three summary renderers. #598: an incomplete figure
+// must never read as complete, and a $0 incomplete figure must not vanish
+// the cost line entirely (the report renderer's old cost>0 gate did exactly
+// that).
+//
+// There are TWO kinds of incompleteness and they err in OPPOSITE directions,
+// so they get two labels and two lines — never one merged list:
+//
+//	unpriced_models        the model has NO pricing record. Its spend is
+//	                       attributed $0, so the figure is a LOWER bound
+//	                       (#216/#598).
+//	unpriced_cache_models  the model IS priced; only its cache multipliers
+//	                       are absent, so its cached traffic billed at the
+//	                       full input rate. The figure is an UPPER bound
+//	                       (#626).
+//
+// Merging them (the F661-2 shape) told the operator a priced model such as
+// gpt-4o (input $2.50 / output $10.00) was "unpriced", and made a bounded
+// over-estimate indistinguishable from an altogether missing figure.
 func renderCostBlock(usage map[string]any) {
 	cost := floatFromAny(usage["total_cost_usd"])
 	incomplete, _ := usage["cost_incomplete"].(bool)
-	unpriced, _ := usage["unpriced_models"].([]any)
+	rawUnpriced, _ := usage["unpriced_models"].([]any)
+	rawCacheUnpriced, _ := usage["unpriced_cache_models"].([]any)
+	unpriced := stringIDs(rawUnpriced)
+	cacheUnpriced := stringIDs(rawCacheUnpriced)
+
+	// The cost label names the condition(s) that actually hold. The
+	// pricing-absent wording is unchanged from #598 so that case renders
+	// byte-identically to before.
 	costLabel := "Cost"
-	if incomplete {
+	switch {
+	case len(unpriced) > 0 && len(cacheUnpriced) > 0:
+		costLabel = "Cost (incomplete — at least one model unpriced; " +
+			"cached traffic at the full input rate)"
+	case len(unpriced) > 0:
+		costLabel = "Cost (incomplete — at least one model unpriced)"
+	case len(cacheUnpriced) > 0:
+		costLabel = "Cost (upper bound — cache rates not configured)"
+	case incomplete:
+		// cost_incomplete without either id list: keep the #598 promise
+		// that an incomplete figure never reads as complete.
 		costLabel = "Cost (incomplete — at least one model unpriced)"
 	}
 	PrintKeyValue(costLabel, fmt.Sprintf("$%.4f", cost))
-	ids := make([]string, 0, len(unpriced))
-	for _, u := range unpriced {
-		if id, ok := u.(string); ok {
-			ids = append(ids, id)
-		}
+
+	if len(unpriced) > 0 {
+		PrintKeyValue("Unpriced models", strings.Join(unpriced, ", "))
 	}
-	// F661-2 (the #626 review): a cache-only incompleteness carries its
-	// ids under unpriced_cache_models — without this read the terminal
-	// printed "at least one model unpriced" with NO model named.
-	cacheUnpriced, _ := usage["unpriced_cache_models"].([]any)
-	for _, u := range cacheUnpriced {
-		if id, ok := u.(string); ok {
-			ids = append(ids, id)
-		}
-	}
-	if len(ids) > 0 {
-		PrintKeyValue("Unpriced models", strings.Join(ids, ", "))
+	if len(cacheUnpriced) > 0 {
+		PrintKeyValue("Cache rates not configured",
+			strings.Join(cacheUnpriced, ", ")+
+				" (cached traffic priced at the full input rate — an upper bound)")
 	}
 }
 

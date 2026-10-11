@@ -1308,4 +1308,14 @@ def _usage_to_info(usage: dict):
         total_cost_usd=usage.get("cost_usd", 0.0),
         cost_incomplete=bool(usage.get("cost_incomplete", False)),
         unpriced_models=list(usage.get("unpriced_models") or []),
+        # #626: the cache line items reached this bridge and were dropped,
+        # so ReportResult.usage always read 0/0/[] while the tracker's
+        # totals (-> scan.report.json) carried the real figures — one scan
+        # shipping two different answers. unpriced_cache_models stays its
+        # OWN list: a PRICED model whose cached traffic fell back to the
+        # full input rate (an upper bound) is not a model with no pricing
+        # record (a lower bound).
+        total_cache_read_tokens=int(usage.get("cache_read_tokens") or 0),
+        total_cache_write_tokens=int(usage.get("cache_write_tokens") or 0),
+        unpriced_cache_models=list(usage.get("unpriced_cache_models") or []),
     )

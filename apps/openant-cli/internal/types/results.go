@@ -113,11 +113,11 @@ type EnhanceData struct {
 
 // VerifyData is returned by the `verify` command.
 type VerifyData struct {
-	VerifiedResultsPath      string    `json:"verified_results_path"`
-	FindingsInput            int       `json:"findings_input"`
-	FindingsVerified         int       `json:"findings_verified"`
-	Agreed                   int       `json:"agreed"`
-	Disagreed                int       `json:"disagreed"`
+	VerifiedResultsPath string `json:"verified_results_path"`
+	FindingsInput       int    `json:"findings_input"`
+	FindingsVerified    int    `json:"findings_verified"`
+	Agreed              int    `json:"agreed"`
+	Disagreed           int    `json:"disagreed"`
 	// #622: BOTH reclassification siblings — the Python VerifyResult.to_dict
 	// envelope carries them (the "Disagreed (eliminated)" display's source);
 	// without them the companion lines are unrenderable.
@@ -154,4 +154,18 @@ type UsageInfo struct {
 	// complete figure it is not.
 	CostIncomplete bool     `json:"cost_incomplete,omitempty"`
 	UnpricedModels []string `json:"unpriced_models,omitempty"`
+	// #626: the cache line items. Without these the typed path silently
+	// DROPPED them — the terminal renderer survived only because it reads
+	// map[string]any. omitempty mirrors the Python side's present-only
+	// envelope (core/schemas.py UsageInfo.to_dict), so a no-cache run
+	// round-trips to exactly the pre-#626 key set.
+	//
+	// UnpricedCacheModels is NOT interchangeable with UnpricedModels: the
+	// former is a PRICED model whose cache multipliers are absent (its
+	// cached traffic billed at the full input rate — an upper bound); the
+	// latter has no pricing record at all (its spend attributed $0 — a
+	// lower bound). Never merge the two lists.
+	TotalCacheReadTokens  int      `json:"total_cache_read_tokens,omitempty"`
+	TotalCacheWriteTokens int      `json:"total_cache_write_tokens,omitempty"`
+	UnpricedCacheModels   []string `json:"unpriced_cache_models,omitempty"`
 }
