@@ -884,6 +884,22 @@ class FindingVerifier:
                 _summary_input_tokens += usage.get("input_tokens", 0)
                 _summary_output_tokens += usage.get("output_tokens", 0)
                 _summary_cost_usd += usage.get("cost_usd", 0.0)
+                # #626/PR#661 V1: fold the FRESH unit's incompleteness, BOTH
+                # kinds. This hop folded the three numeric keys and neither
+                # ID set, while ``_usage_dict`` reads only the restore
+                # loop's accumulators (:833-837) — so verify/_summary.json
+                # reported a COMPLETE cost after a first run's unpriced
+                # spend, and a resumed run kept the restored ids while
+                # silently losing this run's. The ids DO arrive here:
+                # ``_verify_one`` returns ``tracker.get_unit_usage()``,
+                # which stamps both kinds via ``incomplete_markers``.
+                # The sets are mutated in place (no ``nonlocal``) and both
+                # batch runners invoke this callback from the MAIN thread
+                # (the sequential loop and the ``as_completed`` loop), the
+                # same contract the counter folds above rely on.
+                _fresh_u, _fresh_c = unpriced_kinds_from(usage)
+                _summary_unpriced.update(_fresh_u)
+                _summary_unpriced_cache.update(_fresh_c)
             if checkpoint is not None:
                 checkpoint.write_summary(total, _summary_completed, _summary_errors,
                                          _summary_error_breakdown, phase="in_progress",
