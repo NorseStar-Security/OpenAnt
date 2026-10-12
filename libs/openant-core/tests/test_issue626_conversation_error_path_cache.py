@@ -388,7 +388,10 @@ def _error_path_recorders():
                             guard = walk
                             break
                     kws = {k.arg: k.value for k in node.keywords if k.arg}
-                    key = (str(path.relative_to(_REPO_ROOT)),
+                    # as_posix(), not str(): on Windows str() yields
+                    # backslashes and every key misses _EXPECTED (the CI
+                    # windows-latest leg caught exactly that).
+                    key = (path.relative_to(_REPO_ROOT).as_posix(),
                            owner.get(node, "<module>"))
                     # a LIST, not an assignment: two recorders inside ONE
                     # function would otherwise collapse to a single key and
@@ -427,6 +430,9 @@ class TestTheRecorderClassIsClosed:
 
     def test_the_population_is_exactly_the_three_known_sinks(self):
         found = _error_path_recorders()
+        # the keys are POSIX on every platform (the windows-latest leg of CI
+        # caught a str()-vs-as_posix() miss here before this pin existed)
+        assert all("\\" not in path for path, _ in found), sorted(found)
         total = sum(len(v) for v in found.values())
         assert total == 3, (
             "the error-path recorder COUNT moved: "
