@@ -41,7 +41,6 @@ present-only discipline the #626 artifact shape depends on.
 from __future__ import annotations
 
 import ast
-import copy
 import json
 import math
 import os
@@ -698,29 +697,12 @@ _EXPECTED_LEDGER_GATES = {
 _CACHE_AWARE_TERMS = ("billed", "cache_read", "cache_write", "cache_creation",
                       "read_total", "write_total")
 
+#: one-slot memo for the census (see the note in _ledger_gates)
+_LEDGER_GATE_CACHE: list = []
 
-class _InlineLocals(ast.NodeTransformer):
-    """Round-4's rename-defeat guard, reused: resolve a gate's test through
-    its enclosing function's single-Name assignments, so ``usage_in`` reads as
-    the ``meta.get('input_tokens') + ...`` it actually is.
 
-    Needed in BOTH directions here, which round 4 did not have to handle:
-    inlining alone also DESTROYS a counter whose initialiser is a literal
-    (``_summary_input_tokens = 0`` makes the test read ``0 or 0 or ...`` and
-    erases the very name the census keys on), so the raw and inlined name
-    views are UNIONED below. Either view naming a kind counts.
-    """
-
-    def __init__(self, bindings, depth=0):
-        self.bindings = bindings
-        self.depth = depth
-
-    def visit_Name(self, node):
-        repl = self.bindings.get(node.id)
-        if repl is not None and self.depth < 6:
-            return _InlineLocals(self.bindings,
-                                 self.depth + 1).visit(copy.deepcopy(repl))
-        return node
+#: how far a renamed intermediate is chased through local assignments
+_INLINE_DEPTH = 6
 
 
 def _names(node) -> set:
@@ -736,8 +718,40 @@ def _names(node) -> set:
 
 
 def _both_views(node, bindings) -> set:
-    return _names(node) | _names(
-        _InlineLocals(bindings).visit(copy.deepcopy(node)))
+    """Round-4's rename-defeat guard: resolve a gate's test through its
+    enclosing function's single-Name assignments, so ``usage_in`` reads as the
+    ``meta.get('input_tokens') + ...`` it actually is.
+
+    The resolution is needed in BOTH directions, which round 4 did not have to
+    handle: substitution ALONE also destroys a counter whose initialiser is a
+    literal (``_summary_input_tokens = 0`` makes the test read ``0 or 0 or
+    ...`` and erases the very name the census keys on). So the raw and
+    resolved views are UNIONED -- either view naming a kind counts.
+
+    Computed as a transitive NAME CLOSURE rather than by substituting into a
+    copied tree. The two are equivalent here because only the resulting name
+    SET is ever consulted, never the rewritten tree -- and the closure needs
+    no ``deepcopy`` per node. That is a runtime fix with teeth: the
+    substituting version took the windows-latest CI leg (timeout-minutes 15)
+    from 9m10s to a 15m13s cancellation.
+    """
+    out = _names(node)
+    frontier, seen = set(out), set()
+    for _ in range(_INLINE_DEPTH):
+        nxt: set = set()
+        for nm in frontier:
+            if nm in seen:
+                continue
+            seen.add(nm)
+            repl = bindings.get(nm)
+            if repl is not None:
+                nxt |= _names(repl)
+        nxt -= out
+        if not nxt:
+            break
+        out |= nxt
+        frontier = nxt
+    return out
 
 
 def _ledger_gates():
@@ -759,6 +773,12 @@ def _ledger_gates():
     * a gate whose condition is computed in a helper CALL (rather than
       lexically in the ``if``) and whose name carries no token or spend term
       is not seen;
+    * a file is PRE-FILTERED out unless its text contains "cost" and either
+      "token" or "turn_has_spend". That costs this pin nothing by its own
+      membership rule (a member's body must name a cost-ish term and its test
+      must name both token kinds or call the predicate, so a file lacking
+      those words can hold no member) -- but it is a text filter in front of
+      an AST census, so it is named here rather than left implicit;
     * a gate whose token source resolves to a LITERAL rather than to a read of
       an ``input_tokens``/``output_tokens`` key is not seen either. A probe
       injecting ``_probe_in = 0; if _probe_in or _probe_out:`` survived this
@@ -768,6 +788,8 @@ def _ledger_gates():
       the pin load-bearing in practice — but a gate fed by a renamed
       intermediate assigned OUTSIDE the enclosing function would escape.
     """
+    if _LEDGER_GATE_CACHE:
+        return _LEDGER_GATE_CACHE[0]
     found: dict = {}
     for dirpath, dirnames, filenames in os.walk(_REPO_ROOT):
         dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
@@ -776,7 +798,25 @@ def _ledger_gates():
                 continue
             path = Path(dirpath) / fn
             try:
-                tree = ast.parse(path.read_text(encoding="utf-8"))
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            # CHEAP PRE-FILTER, and it costs the pin nothing: membership
+            # below requires a "cost"-ish NAME in the guarded body, so a file
+            # whose text never says "cost" can hold no member -- and skipping
+            # it avoids both the parse and the inlining deepcopies. This is a
+            # RUNTIME fix, not a scope change: the windows-latest CI leg has
+            # timeout-minutes 15 and three un-memoized full-tree walks with
+            # per-node deepcopy took it from 9m10s to a 15m13s cancellation.
+            if "cost" not in text:
+                continue
+            # the same argument for the TEST side: membership requires the
+            # test to name both token kinds or to call the predicate, and
+            # either way the file's text must contain one of these.
+            if "token" not in text and "turn_has_spend" not in text:
+                continue
+            try:
+                tree = ast.parse(text)
             except SyntaxError:
                 continue
             # INNERMOST-function scoping, both for the sink key and for the
@@ -846,6 +886,9 @@ def _ledger_gates():
                     "uses_predicate": uses_predicate,
                     "consults_cost": any("cost" in n for n in tnames),
                 })
+    # memoized: three tests below ask the same question of an unchanging
+    # tree, and the walk is the whole cost of this file.
+    _LEDGER_GATE_CACHE.append(found)
     return found
 
 
