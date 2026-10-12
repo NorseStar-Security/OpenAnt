@@ -818,15 +818,92 @@ def _parse_python(repo_path: str, output_dir: str, processing_level: str, skip_t
 # JavaScript/TypeScript parser
 # ---------------------------------------------------------------------------
 
+def _lock_dependency_pins(lock_path: Path) -> dict[str, tuple[str | None, str | None]]:
+    """Map ``node_modules/...`` path -> ``(version, integrity)`` from a lockfile.
+
+    Reads both npm lockfile flavours with the same code: the committed
+    ``package-lock.json`` and the ``node_modules/.package-lock.json`` npm
+    leaves behind in an installed tree.
+
+    Three kinds of entry are EXCLUDED, because the two files legitimately
+    disagree about them and comparing them would report a correct tree as
+    stale -- which would re-run ``npm install`` on every single parse:
+
+    * the root ``""`` entry -- it describes this project rather than a
+      dependency, and only the committed file carries it;
+    * ``optional`` entries -- the lockfile enumerates every platform's
+      prebuilt native binary, and a machine installs only the one matching
+      it (here: one of the ``@typescript/typescript-*`` set);
+    * ``dev`` entries -- a production install omits devDependencies.
+
+    Integrity is compared alongside the version: a republished tarball keeps
+    the version string and changes the hash.
+
+    Raises:
+        ValueError: the file is not a lockfile shape (including torn JSON).
+        OSError: the file could not be read.
+    """
+    data = read_json(lock_path)
+    if not isinstance(data, dict):
+        raise ValueError(f"{lock_path}: lockfile is not a JSON object")
+    packages = data.get("packages")
+    if not isinstance(packages, dict):
+        raise ValueError(f"{lock_path}: lockfile has no 'packages' object")
+
+    pins: dict[str, tuple[str | None, str | None]] = {}
+    for name, meta in packages.items():
+        if not name:
+            continue  # the root entry
+        if not isinstance(meta, dict):
+            raise ValueError(f"{lock_path}: lockfile entry {name!r} is not an object")
+        if meta.get("optional") or meta.get("dev"):
+            continue
+        pins[name] = (meta.get("version"), meta.get("integrity"))
+    return pins
+
+
 def _js_deps_installed() -> bool:
-    """Return True only if a *complete* npm install has previously succeeded.
+    """Return True only if a *complete and current* npm install is in place.
 
     Checking that ``node_modules/`` exists is not enough: a prior install that
     was killed (Ctrl+C, OOM, disk full) leaves a partial directory. npm writes
     ``node_modules/.package-lock.json`` at the *end* of a successful install,
     so we use that as the completion sentinel.
+
+    The sentinel's EXISTENCE is not enough either: it records that an install
+    finished, not that it installed what ``package-lock.json`` now pins. On
+    its own it made a lockfile bump -- a transitive security upgrade, say --
+    a no-op for every checkout that had already bootstrapped once: the
+    sentinel was still there, so the bootstrap skipped and the outdated tree
+    was reused indefinitely. So the sentinel is also COMPARED against the
+    committed lockfile, and a mismatch re-runs the install.
     """
-    return (_JS_PARSER_DIR / "node_modules" / ".package-lock.json").is_file()
+    marker = _JS_PARSER_DIR / "node_modules" / ".package-lock.json"
+    if not marker.is_file():
+        return False
+
+    committed_lock = _JS_PARSER_DIR / "package-lock.json"
+    if not committed_lock.is_file():
+        # Nothing to be stale relative to: keep the completion sentinel as
+        # the sole signal, exactly as before.
+        return True
+
+    try:
+        installed = _lock_dependency_pins(marker)
+        required = _lock_dependency_pins(committed_lock)
+    except (OSError, ValueError):
+        # A torn or unreadable lockfile is NOT an error to raise from here.
+        # npm rewrites the marker in place, so a concurrent bootstrap can be
+        # observed mid-write, and both call sites below run this check --
+        # including the fast path outside the lock. Report "not installed"
+        # and let the caller re-bootstrap under the lock.
+        return False
+
+    # SYMMETRIC equality, not "is everything the lock requires present?". An
+    # EXTRA installed package is a dependency the lockfile no longer pins (a
+    # removed or downgraded transitive) and it stays importable on disk until
+    # the install is redone, so it has to read as stale too.
+    return installed == required
 
 
 # #325: the npm-install bootstrap bound — the parse-step convention (PR
