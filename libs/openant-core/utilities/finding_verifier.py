@@ -40,7 +40,7 @@ from typing import Callable, Optional
 
 from .llm_client import (TokenTracker, error_path_turn,
                          get_global_tracker, incomplete_markers,
-                         unpriced_kinds_from)
+                         turn_has_spend, unpriced_kinds_from)
 from .llm import (
     LLMRateLimitError,
     Message,
@@ -864,8 +864,13 @@ class FindingVerifier:
             return usage
 
         # Inject prior usage into tracker so step_report captures the total
-        if (_summary_input_tokens or _summary_output_tokens
-                or _summary_unpriced or _summary_unpriced_cache):
+        # F661-3: the ONE spend predicate — cost included (astra's falsifier
+        # measured exactly this site: $0.120 restored, $0.000 injected).
+        if turn_has_spend(input_tokens=_summary_input_tokens,
+                          output_tokens=_summary_output_tokens,
+                          cost_usd=_summary_cost_usd,
+                          unpriced=_summary_unpriced,
+                          unpriced_cache=_summary_unpriced_cache):
             self.tracker.add_prior_usage(
                 _summary_input_tokens, _summary_output_tokens, _summary_cost_usd,
                 unpriced_models=sorted(_summary_unpriced) or None,

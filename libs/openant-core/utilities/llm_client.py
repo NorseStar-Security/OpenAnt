@@ -407,6 +407,80 @@ def unpriced_kinds_from(usage) -> tuple[list[str], list[str]]:
             list(usage.get("unpriced_cache_models") or []))
 
 
+def turn_has_spend(usage=None, *, input_tokens=None, output_tokens=None,
+                   cost_usd=None, unpriced=None, unpriced_cache=None) -> bool:
+    """Did this turn / unit / phase actually spend anything?
+
+    THE one predicate every ledger WRITE GATE and resume SEED condition keys
+    on, and the COST disjunct is the whole reason it exists. Cache-only spend
+    — a turn billed entirely as a cache read — reaches these ledgers as 0
+    input / 0 output tokens carrying a real dollar cost (the enhance, analyze
+    and verify ledgers never see a cache token key: cache spend arrives folded
+    into ``cost_usd``), and on a PRICED model there is no unpriced marker
+    either. A gate that asks only about tokens and markers therefore answers
+    "no work happened" about a turn that cost money — so the usage block is
+    not written, the prior usage is not injected, and the spend is orphaned on
+    resume while the phase summary, whose folds are unguarded, reports the
+    dollars in full.
+
+    Five sites asked that question five times and all five omitted cost
+    (context_enhancer.py:809/:1032/:1239, analyzer.py:865,
+    finding_verifier.py:867). It is ONE predicate missing at five places, not
+    five bugs, which is why it lives here beside ``incomplete_markers`` and
+    ``unpriced_kinds_from`` rather than being re-derived per site.
+
+    Two call shapes, because the five sites need both:
+
+      * ``turn_has_spend(usage_dict)`` — a persisted ``usage`` /
+        ``agent_state`` block. The marker kinds are read through
+        ``unpriced_kinds_from``, so this stays the symmetric partner of
+        ``incomplete_markers``: one place knows which keys carry what.
+      * ``turn_has_spend(input_tokens=..., output_tokens=..., cost_usd=...,
+        unpriced=..., unpriced_cache=...)`` — loose accumulators.
+
+    A keyword ALWAYS overrides the dict, so a site may pass the dict and
+    override just the kinds it merged from several sources. Each of the five
+    is resolved INDEPENDENTLY: passing ``unpriced=`` alone must not suppress
+    the dict's ``unpriced_cache_models`` (an all-or-nothing marker pair would
+    silently under-report the other kind at a future site, and the census pin
+    that funnels new gates here only checks that this predicate is CALLED).
+
+    Returns False for a genuinely empty turn — all zero, no markers. That is
+    load-bearing, not a detail: the present-only artifact discipline depends
+    on a no-spend phase still writing NO usage block and injecting nothing, so
+    a clean run's checkpoint stays byte-identical to the pre-#598 shape.
+
+    Never raises. Every caller also reads LEGACY checkpoints, two of them on
+    worker threads, and three of these gates previously tested bare
+    truthiness — so a malformed payload that used to read falsy (``[]``) must
+    not start raising inside the gate.
+    """
+    src = usage if isinstance(usage, dict) else {}
+    if input_tokens is None:
+        input_tokens = src.get("input_tokens", 0)
+    if output_tokens is None:
+        output_tokens = src.get("output_tokens", 0)
+    if cost_usd is None:
+        cost_usd = src.get("cost_usd", 0.0)
+    if unpriced is None or unpriced_cache is None:
+        _src_unpriced, _src_cache = unpriced_kinds_from(src)
+        if unpriced is None:
+            unpriced = _src_unpriced
+        if unpriced_cache is None:
+            unpriced_cache = _src_cache
+
+    def _num(value) -> float:
+        try:
+            return float(value or 0)
+        except (TypeError, ValueError):
+            # a malformed legacy payload: fall back to truthiness rather than
+            # raise inside a gate that previously only tested truthiness
+            return 1.0 if value else 0.0
+
+    return bool(_num(input_tokens) or _num(output_tokens) or _num(cost_usd)
+                or unpriced or unpriced_cache)
+
+
 def unit_unpriced_kinds(tracker) -> dict:
     """The current thread's per-unit unpriced ids, BOTH kinds, as kwargs.
 

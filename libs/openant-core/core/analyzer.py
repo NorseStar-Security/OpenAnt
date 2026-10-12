@@ -28,6 +28,7 @@ from core.progress import ProgressReporter
 # Import existing analysis machinery
 from utilities.llm_client import (get_global_tracker,
                                   incomplete_markers,
+                                  turn_has_spend,
                                   unpriced_kinds_from)
 from utilities.llm import (
     PhaseBinding,
@@ -862,8 +863,14 @@ def run_analysis(
         return usage
 
     # Inject prior usage into tracker so step_report captures the total
-    if (_summary_input_tokens or _summary_output_tokens or _summary_unpriced
-            or _summary_unpriced_cache):
+    # F661-3: the ONE spend predicate (see utilities.llm_client) — cost
+    # included, or a resumed analyze whose restored spend was cache-only
+    # injects nothing and every later step report under-counts.
+    if turn_has_spend(input_tokens=_summary_input_tokens,
+                      output_tokens=_summary_output_tokens,
+                      cost_usd=_summary_cost_usd,
+                      unpriced=_summary_unpriced,
+                      unpriced_cache=_summary_unpriced_cache):
         get_global_tracker().add_prior_usage(
             _summary_input_tokens, _summary_output_tokens, _summary_cost_usd,
             unpriced_models=sorted(_summary_unpriced) or None,

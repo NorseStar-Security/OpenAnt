@@ -25,7 +25,8 @@ from typing import Callable, Optional
 
 from .model_config import CLAUDE_SONNET_4_20250514
 from .llm_client import (TokenTracker, get_global_tracker,
-                         incomplete_markers, unpriced_kinds_from)
+                         incomplete_markers, turn_has_spend,
+                         unpriced_kinds_from)
 from .llm import (
     LLMAuthError,
     LLMConnectionError,
@@ -806,8 +807,14 @@ class ContextEnhancer:
                                       usage=_usage_dict())
 
             # Inject prior usage into tracker so step_report captures the total
-            if (_summary_input_tokens or _summary_output_tokens
-                    or _summary_unpriced or _summary_unpriced_cache):
+            # F661-3: the ONE spend predicate — the cost disjunct is what
+            # keeps cache-only restored spend (0 tokens, real dollars) from
+            # being orphaned while _usage_dict() reports it in full.
+            if turn_has_spend(input_tokens=_summary_input_tokens,
+                              output_tokens=_summary_output_tokens,
+                              cost_usd=_summary_cost_usd,
+                              unpriced=_summary_unpriced,
+                              unpriced_cache=_summary_unpriced_cache):
                 self.tracker.add_prior_usage(
                     _summary_input_tokens, _summary_output_tokens, _summary_cost_usd,
                     unpriced_models=sorted(_summary_unpriced) or None,
@@ -1029,9 +1036,11 @@ class ContextEnhancer:
                 _wiped_state = ((_wiped_err.get("agent_state") or {})
                                 if isinstance(_wiped_err, dict) else {})
                 _wiped_u, _wiped_c = unpriced_kinds_from(_wiped_state)
-                if (_wiped_state.get("input_tokens")
-                        or _wiped_state.get("output_tokens")
-                        or _wiped_u or _wiped_c):
+                # F661-3: the ONE spend predicate. The kinds are passed
+                # explicitly so the gate and the accumulate below agree on the
+                # same merged sets.
+                if turn_has_spend(_wiped_state, unpriced=_wiped_u,
+                                  unpriced_cache=_wiped_c):
                     # key: the SAME expression the save reads (get("id",
                     # "unknown") - #609 hunt: an id-less unit's moved spend
                     # was silently dropped when the keys diverged).
@@ -1236,7 +1245,12 @@ class ContextEnhancer:
         # trace is the unpriced id must still write the usage block, or
         # a resume loses the marker (#609 extends the gate to all three
         # sources).
-        if usage_in or usage_out or usage_unpriced or usage_unpriced_cache:
+        # F661-3: the ONE spend predicate, over the SAME three merged
+        # sources the block below writes — a cache-only attempt costs real
+        # dollars at zero tokens, and the resume reader sums these blocks.
+        if turn_has_spend(input_tokens=usage_in, output_tokens=usage_out,
+                          cost_usd=usage_cost, unpriced=usage_unpriced,
+                          unpriced_cache=usage_unpriced_cache):
             cp_data["usage"] = {
                 "input_tokens": usage_in,
                 "output_tokens": usage_out,
