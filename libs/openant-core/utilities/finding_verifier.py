@@ -38,8 +38,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from .llm_client import (TokenTracker, get_global_tracker,
-                         incomplete_markers, unpriced_kinds_from)
+from .llm_client import (TokenTracker, error_path_turn,
+                         get_global_tracker, incomplete_markers,
+                         unpriced_kinds_from)
 from .llm import (
     LLMRateLimitError,
     Message,
@@ -501,32 +502,47 @@ class FindingVerifier:
                     messages=messages,
                 )
             except Exception as exc:
-                exc_in = int(getattr(exc, "input_tokens", 0) or 0)
-                exc_out = int(getattr(exc, "output_tokens", 0) or 0)
-                # Only LLMResponseError carries the raising turn's tokens;
+                # Only LLMResponseError carries the raising turn's usage;
                 # connection/auth/limit errors contribute nothing (and a
                 # turn-1 failure with zero accumulated usage writes NO
                 # record — the helpers' guard, mirrored: record_call
                 # appends a $0 call record unconditionally otherwise).
-                if (total_input_tokens or total_output_tokens
-                        or exc_in or exc_out):
+                #
+                # #626 round 4: the raising turn is read through the ONE
+                # shared error-path constructor (llm_client.error_path_turn,
+                # beside normalize_cache_usage) — the same channel the F-A1
+                # fix built for helpers.simple_completion. It brings the two
+                # things this site re-derived and got wrong:
+                #   * the turn's own ``usage_details``, instead of a
+                #     hard-coded None entry. #626 prices the cache entirely
+                #     off usage_details, so the None dropped the rejected
+                #     turn's cache read from the cost AND from both cache
+                #     line items, with cost_incomplete FALSE: $0.075 against
+                #     $0.120 real on the shipped claude-opus-5 rate.
+                #   * ``billed``, which consults the CACHE counts. On the
+                #     EXCLUSIVE (anthropic) shape a full cache hit arrives as
+                #     0 input / 0 output with a 90k billed read, so the old
+                #     input/output-only guard dropped that call WHOLESALE.
+                # It also never raises (#609 ENG-1): the bare int() coercions
+                # here could turn an accounting failure into a replacement of
+                # the original exception, whose retryability class is what
+                # the callers key on.
+                turn = error_path_turn(exc)
+                if (total_input_tokens or total_output_tokens or turn.billed):
                     # The raising turn's usage is ONLY on the exception
                     # (the accumulation below runs after complete returns).
-                    # Its per-turn list entry is appended ONLY when the
-                    # exception carries tokens (LLMResponseError) — a
-                    # connection/auth/limit raise billed nothing for the
-                    # raising turn, so no entry is added for it (the list
-                    # length equals the turns billed). Conversation-level
-                    # record, never relabeled per-request.
+                    # Its per-turn list entry is appended ONLY when the turn
+                    # BILLED, so the list length stays the count of turns
+                    # billed (#624). Conversation-level record, never
+                    # relabeled per-request.
+                    turn_details = per_turn_usage_details + turn.entries
                     self.tracker.record_call(
                         model=self.binding.model,
-                        input_tokens=total_input_tokens + exc_in,
-                        output_tokens=total_output_tokens + exc_out,
+                        input_tokens=total_input_tokens + turn.input_tokens,
+                        output_tokens=total_output_tokens + turn.output_tokens,
                         pricing=lookup_pricing(self.binding),
-                        usage_details=per_turn_usage_details
-                        + ([None] if (exc_in or exc_out) else []),
-                        turns=len(per_turn_usage_details
-                        + ([None] if (exc_in or exc_out) else [])),
+                        usage_details=turn_details,
+                        turns=len(turn_details),
                     )
                 raise
 

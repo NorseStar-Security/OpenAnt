@@ -16,9 +16,9 @@ import sys
 from typing import Optional, Set, List
 
 from core.file_boundary import boundary_for_language
-from ..llm_client import (TokenTracker, get_global_tracker,
-                          incomplete_markers, record_accounting_error,
-                          unit_unpriced_kinds)
+from ..llm_client import (TokenTracker, error_path_turn,
+                          get_global_tracker, incomplete_markers,
+                          record_accounting_error, unit_unpriced_kinds)
 from ..llm import (
     Message,
     PhaseBinding,
@@ -333,11 +333,30 @@ class ContextAgent:
                 # exception with a non-int-coercible token attr must not
                 # replace the original (the ENG-1 class; in-tree carriers
                 # int-coerce at construction, this is the belt).
-                try:
-                    exc_in = int(getattr(exc, "input_tokens", 0) or 0)
-                    exc_out = int(getattr(exc, "output_tokens", 0) or 0)
-                except Exception:
-                    exc_in = exc_out = 0
+                #
+                # #626 round 4: that read — and the guard, and the per-turn
+                # entry — now come from the ONE shared error-path constructor
+                # (llm_client.error_path_turn, beside normalize_cache_usage;
+                # the same channel the F-A1 fix built for
+                # helpers.simple_completion). The guarded coercion moved
+                # INSIDE it unchanged, and it carries the two things this
+                # site had re-derived and got wrong:
+                #   * the raising turn's own ``usage_details`` instead of a
+                #     hard-coded None entry. #626 prices the cache entirely
+                #     off usage_details, so the None dropped the rejected
+                #     turn's cache read from the cost and from both cache
+                #     line items — and agent_state is the ONLY carrier of a
+                #     failed attempt's spend (agent_metadata is absent on
+                #     error), so it was dropped from the enhance summary, the
+                #     checkpoint and the resume at once. $0.075 against
+                #     $0.120 real on the shipped claude-opus-5 rate.
+                #   * ``billed``, which consults the CACHE counts: on the
+                #     EXCLUSIVE (anthropic) shape a full cache hit arrives as
+                #     0 input / 0 output with a 90k billed read, which the
+                #     input/output-only guard dropped WHOLESALE.
+                turn = error_path_turn(exc)
+                exc_in = turn.input_tokens
+                exc_out = turn.output_tokens
                 attempt_cost = 0.0
                 # #626/PR#661 hunt F4: the failed attempt's unpriced ids,
                 # BOTH kinds (replaces the single ``attempt_unpriced``).
@@ -346,7 +365,7 @@ class ContextAgent:
                 attempt_kinds = {"unpriced_models": None,
                                  "unpriced_cache_models": None}
                 if (total_input_tokens or total_output_tokens
-                        or exc_in or exc_out):
+                        or turn.billed):
                     # ENG-1 (#609 pre-code check): an accounting failure
                     # here must never replace the original exception —
                     # its retryability class (rate_limit vs connection vs
@@ -355,15 +374,14 @@ class ContextAgent:
                     # pricing dict would otherwise reclassify a transient
                     # rate limit as a non-retryable KeyError.
                     try:
+                        turn_details = per_turn_usage_details + turn.entries
                         call_record = self.tracker.record_call(
                             model=self.binding.model,
                             input_tokens=total_input_tokens + exc_in,
                             output_tokens=total_output_tokens + exc_out,
                             pricing=lookup_pricing(self.binding),
-                            usage_details=per_turn_usage_details
-                            + ([None] if (exc_in or exc_out) else []),
-                            turns=len(per_turn_usage_details
-                            + ([None] if (exc_in or exc_out) else [])),
+                            usage_details=turn_details,
+                            turns=len(turn_details),
                         )
                         # the reads live INSIDE the guard's try: a double
                         # returning None from record_call must hit the

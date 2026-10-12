@@ -201,6 +201,93 @@ def normalize_cache_usage(usage_details: dict | list | None) -> CacheCounts:
     return CacheCounts(read, write, read_incl, write_incl)
 
 
+class ErrorPathTurn(NamedTuple):
+    """The RAISING turn's own billed usage, read off an exception. PURE.
+
+    Built by :func:`error_path_turn` — see there for why this type exists at
+    all rather than three copies of the same four lines.
+    """
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    #: the raising turn's ``usage_details`` VERBATIM (#211), or None when the
+    #: exception carried none. A dict only: a single turn's detail.
+    usage_details: dict | None = None
+
+    @property
+    def billed(self) -> bool:
+        """Did the provider bill for the raising turn at all?
+
+        The CACHE counts are part of the answer, and that is the whole point:
+        on the EXCLUSIVE (anthropic) shape the cached read is DISJOINT from
+        ``input_tokens``, so a full cache hit arrives as 0 input / 0 output
+        with a 90k billed read. A guard that consults only input/output drops
+        that call WHOLESALE — the F-A1 round's M4 mutant.
+        """
+        return bool(self.input_tokens or self.output_tokens
+                    or normalize_cache_usage(self.usage_details).any)
+
+    @property
+    def entries(self) -> list:
+        """The raising turn's per-turn ``usage_details`` entries, for
+        concatenation onto a conversation's list.
+
+        ONE entry when the turn billed, NONE when it did not — so
+        ``len(list)`` stays the #624 billed-turn count at every call site, and
+        the entry carries the turn's detail instead of a hard-coded ``None``
+        (the defect: #626 prices entirely off ``usage_details``).
+        """
+        return [self.usage_details] if self.billed else []
+
+
+def error_path_turn(exc: BaseException) -> ErrorPathTurn:
+    """Read the raising turn's billed usage off ``exc``. PURE, never raises.
+
+    THE shared error-path usage constructor. Three recorders fold the same
+    exception into the same ``record_call`` here (the sink-keyed census is
+    closed at three and pinned by
+    ``tests/test_issue626_conversation_error_path_cache.py``):
+    ``llm/helpers.simple_completion``, ``finding_verifier.verify_result`` and
+    ``agentic_enhancer.agent.analyze_unit``. Each had re-derived the same four
+    lines, and #626 — which prices the cache off ``usage_details`` — reached
+    exactly one of the three.
+
+    DUCK-TYPED on purpose: two of the three handlers are ``except Exception``
+    (they must record a conversation's accumulated spend whatever the failure
+    class), so the usage attributes are read by ``getattr``. Only
+    ``LLMResponseError``/``LLMRefusalError`` carry them (#537: a rejected
+    reply the provider billed); a connection/auth/limit error contributes
+    nothing and yields a zero turn.
+
+    It NEVER raises, and that guarantee is load-bearing rather than hygiene
+    (#609 ENG-1): an accounting failure inside an exception handler would
+    REPLACE the original exception, and the original's retryability class
+    (rate_limit vs connection vs structural) is what the retry loops key on.
+    So the coercions are guarded — in ONE try, matching the pre-existing
+    agent.py belt exactly: a foreign exception with a non-int-coercible token
+    attribute yields 0/0, never a partial read.
+
+    There is deliberately NO arithmetic here and no cost: the caller folds
+    these counts into the SAME ``record_call``/``price_usage`` path its success
+    exits use. A second cost formula on the error path is exactly what #598
+    was.
+    """
+    try:
+        exc_in = int(getattr(exc, "input_tokens", 0) or 0)
+        exc_out = int(getattr(exc, "output_tokens", 0) or 0)
+    except Exception:
+        exc_in = exc_out = 0
+    try:
+        details = getattr(exc, "usage_details", None)
+    except Exception:          # a property that raises — the ENG-1 class
+        details = None
+    if not isinstance(details, dict):
+        # #211 verbatim means a dict for ONE turn. Anything else (a list, a
+        # str, a Mock) is not a turn's detail: absent, never fabricated.
+        details = None
+    return ErrorPathTurn(exc_in, exc_out, details)
+
+
 def price_usage(
     input_tokens: int,
     output_tokens: int,
