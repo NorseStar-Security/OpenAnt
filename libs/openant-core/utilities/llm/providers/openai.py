@@ -866,6 +866,12 @@ def _response_to_unified(
             input_tokens=getattr(_usage, "prompt_tokens", 0) if _usage else 0,
             output_tokens=(getattr(_usage, "completion_tokens", 0)
                            if _usage else 0),
+            # F-A1: and the DETAIL fields, from the same extractor the
+            # successful return uses. On this INCLUSIVE shape the cached
+            # portion is already inside prompt_tokens, so the cost figure
+            # barely moves — what was lost was the cost_incomplete
+            # disclosure and both cache line items (the #598 masquerade).
+            usage_details=_extract_usage_details_chat(_usage),
         )
     choice = choices[0]
     message = choice.message
@@ -949,6 +955,9 @@ def _response_to_unified(
             input_tokens=getattr(_usage, "prompt_tokens", 0) if _usage else 0,
             output_tokens=(getattr(_usage, "completion_tokens", 0)
                            if _usage else 0),
+            # F-A1: the DETAIL fields travel with it (see the no-choices
+            # sibling above) — #626's cache accounting lives only here.
+            usage_details=_extract_usage_details_chat(_usage),
         )
 
     if raw_finish not in _OPENAI_FINISH_REASONS:

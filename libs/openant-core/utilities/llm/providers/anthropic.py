@@ -453,6 +453,12 @@ def _response_to_unified(
             f"stop_reason={raw_stop!r}); {_cause}",
             input_tokens=getattr(usage, "input_tokens", 0) if usage else 0,
             output_tokens=getattr(usage, "output_tokens", 0) if usage else 0,
+            # F-A1: the DETAIL fields travel too, from the same extractor
+            # the successful return below calls on this same usage object.
+            # #626 prices the cache portion off these and nowhere else, and
+            # on this EXCLUSIVE shape the cached read is OUTSIDE
+            # input_tokens — dropping it under-reports real spend.
+            usage_details=_extract_usage_details(usage),
         )
 
     if raw_stop not in _ANTHROPIC_STOP_REASONS:
