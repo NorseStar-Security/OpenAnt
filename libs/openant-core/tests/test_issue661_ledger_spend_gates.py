@@ -45,6 +45,7 @@ import json
 import math
 import os
 import sys
+from collections import deque
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -169,6 +170,38 @@ class TestSite1EnhanceResumeSeed:
             "injected $0.000 into the tracker: the gate keys on tokens only, "
             "so cache-only restored spend is dropped from the run total and "
             "every step report downstream of it.")
+
+    def test_an_unbounded_token_count_does_not_crash_the_resume_seed(
+            self, tmp_path):
+        """The reachability leg for the predicate's overflow: a resume whose
+        run-1 checkpoint carries a JSON integer too large for a float.
+
+        RED at d0637b45: OverflowError out of ``turn_has_spend`` ->
+        ``context_enhancer.py:813``, aborting the whole enhance phase. GREEN
+        at c68e9df3, which only tested truthiness — so this test is written
+        against the behaviour the predicate REPLACED, not against a new idea
+        of what it should do.
+        """
+        reset_warning_state()
+        cp_dir = tmp_path / "cp"
+        huge = 10 ** 400
+        _seed_unit_checkpoint(cp_dir, "u1", {
+            "input_tokens": huge, "output_tokens": 0, "cost_usd": 0.25})
+        # the count reaches the gate through a real json round-trip
+        assert json.loads(
+            (cp_dir / "u1.json").read_text())["usage"]["input_tokens"] == huge
+        try:
+            summary, tracker = _drive_enhance(
+                {"units": [{"id": "u1", "code": {"primary_code": "x=1"}}]},
+                cp_dir, _noop_enhance)
+        finally:
+            reset_warning_state()
+
+        assert _cost_eq(summary["usage"]["cost_usd"], 0.25)
+        assert _cost_eq(tracker.get_totals()["total_cost_usd"], 0.25), (
+            "the resume seed must still inject the restored $0.25 when the "
+            "token count is an unbounded integer")
+        assert tracker.get_totals()["total_input_tokens"] == huge
 
     def test_a_genuinely_empty_prior_still_injects_nothing(self, tmp_path):
         """Byte-identity control: an all-zero restored checkpoint is NOT
@@ -656,6 +689,56 @@ class TestTheSpendPredicate:
         assert turn_has_spend({"input_tokens": "abc"}) is True
         assert turn_has_spend({"cost_usd": None, "output_tokens": None}) is False
 
+    def test_an_unbounded_integer_count_is_spend_not_an_OverflowError(self):
+        """N1 of the verify wave, on MY OWN round-5 code: a Python int has no
+        magnitude limit and a float does, so ``float(10**400)`` raises
+        OverflowError — which ``_num`` did not catch.
+
+        This is a ROBUSTNESS REGRESSION, measured as a differential against
+        the expression this predicate replaced: at c68e9df3 the enhance resume
+        seed was a bare ``_summary_input_tokens or ...`` truthiness test, so
+        the same decoded checkpoint restored its $0.25 and the run continued;
+        at d0637b45 it raised out of the gate. A corrupt or adversarial
+        checkpoint must not be able to abort a resume from inside a predicate
+        whose docstring promises it never raises.
+
+        Reachable, not theoretical: JSON integers are unbounded and
+        ``context_enhancer.py:777`` accumulates ``cp_usage.get("input_tokens")``
+        straight off ``read_json`` into the gate at :813.
+
+        The adjudication, stated because it is a judgement and not a
+        derivation: an uncountably large token count is SPEND. Treating it as
+        no-spend would orphan the very dollars that accompany it, which is the
+        defect this whole round removes.
+        """
+        from utilities.llm_client import turn_has_spend
+        huge = 10 ** 400
+        assert turn_has_spend(input_tokens=huge) is True
+        assert turn_has_spend(output_tokens=huge) is True
+        assert turn_has_spend(cost_usd=huge) is True
+        # and through the dict form, the shape a decoded checkpoint arrives in
+        assert turn_has_spend({"input_tokens": huge, "output_tokens": 0,
+                               "cost_usd": 0.0}) is True
+        # a huge NEGATIVE count is still evidence, by the same rule the S9
+        # hunt adjudicated for negative/NaN/inf cost
+        assert turn_has_spend(input_tokens=-huge) is True
+
+    def test_the_609_stringly_typed_zero_is_still_skipped(self):
+        """The differential guard on the N1 fix: the overflow handling must
+        not be bought by widening the truthiness fallback. A legacy payload's
+        string ``"0"`` is NOT spend — it parses to 0.0 — and that is the
+        #609 all-zero skip the round-5 differential measured 52 flips of.
+
+        Unpinned before this round even though the S9 differential relied on
+        it; the ``_num`` edit is exactly the edit that could break it.
+        """
+        from utilities.llm_client import turn_has_spend
+        assert turn_has_spend({"input_tokens": "0", "output_tokens": "0",
+                               "cost_usd": "0"}) is False
+        assert turn_has_spend({"input_tokens": "0.0"}) is False
+        # ... while a non-numeric string stays spend (it carries SOMETHING)
+        assert turn_has_spend({"input_tokens": "abc"}) is True
+
     def test_a_non_dict_usage_is_tolerated(self):
         """Every caller also reads legacy checkpoints — ``unpriced_kinds_from``
         makes the same promise."""
@@ -701,6 +784,11 @@ _CACHE_AWARE_TERMS = ("billed", "cache_read", "cache_write", "cache_creation",
 _LEDGER_GATE_CACHE: list = []
 
 
+#: the AST nodes that introduce a NEW namespace -- a binding inside one of
+#: these does not belong to the enclosing function's scope
+_NESTED_SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
+                       ast.ClassDef)
+
 #: how far a renamed intermediate is chased through local assignments
 _INLINE_DEPTH = 6
 
@@ -715,6 +803,39 @@ def _names(node) -> set:
         elif isinstance(n, ast.Constant) and isinstance(n.value, str):
             out.add(n.value)
     return out
+
+
+def _own_scope_assigns(node) -> dict:
+    """Single-``Name`` assignments belonging to ``node``'s OWN scope.
+
+    THIS IS THE SAME BFS AS ``ast.walk`` -- so which assignment wins the
+    ``setdefault`` for a name bound twice in one scope is unchanged -- with
+    exactly one difference: it does not cross a nested scope boundary. A
+    ``FunctionDef`` / ``AsyncFunctionDef`` / ``Lambda`` / ``ClassDef``
+    introduces its own namespace, and admitting its locals here is the scope
+    defect described in ``_gates_in_source``.
+
+    The narrowing is deliberate and one-directional: a nested scope's names
+    are kept OUT, but an ENCLOSING scope's names are not pulled IN (a closure
+    may legally read them). That second half is the pre-existing disclosed
+    blind spot in ``_ledger_gates``'s docstring, not something this helper
+    changes.
+    """
+    binds: dict = {}
+    # a deque, for the same reason ``ast.walk`` uses one: ``list.pop(0)`` is
+    # O(n) per pop, and this runs over every function in the tree inside a CI
+    # leg whose timeout-minutes margin this pin has already consumed once.
+    queue = deque([node])
+    while queue:
+        cur = queue.popleft()
+        for ch in ast.iter_child_nodes(cur):
+            if isinstance(ch, _NESTED_SCOPE_NODES):
+                continue          # a different namespace: not these locals
+            if (isinstance(ch, ast.Assign) and len(ch.targets) == 1
+                    and isinstance(ch.targets[0], ast.Name)):
+                binds.setdefault(ch.targets[0].id, ch.value)
+            queue.append(ch)
+    return binds
 
 
 def _both_views(node, bindings) -> set:
@@ -752,6 +873,79 @@ def _both_views(node, bindings) -> set:
         out |= nxt
         frontier = nxt
     return out
+
+
+def _gates_in_source(rel: str, text: str) -> dict:
+    """The census of ONE source: ``{(rel, owning function): [site, ...]}``.
+
+    Split out of :func:`_ledger_gates` so the SCOPING rules below can be
+    exercised on a source of the caller's choosing. That is not tidiness: the
+    whole-tree assertion cannot see a scope defect the tree does not happen to
+    contain today, and this function's innermost-scope promise had one (see
+    ``TestTheCensusScopesItsBindingsToTheInnermostFunction``).
+    """
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return {}
+    # INNERMOST-function scoping, both for the sink key and for the inlining
+    # bindings. A flat ast.walk leaks a NESTED function's assignments into the
+    # enclosing one, and that is not academic in EITHER direction:
+    #   * finding_verifier's `_usage_dict` assigns
+    #     `usage = {"input_tokens": ..., "cost_usd": ...}`, which turned a bare
+    #     `if usage:` presence check into a dict naming both token kinds and
+    #     cost — a false sixth member of this class (my own first draft of this
+    #     pin reported exactly that, which is how the blind spot was found);
+    #   * and the mirror, which the first fix of that blind spot left live: a
+    #     nested helper's ZERO-valued local wins the `setdefault` over the
+    #     enclosing ledger loop's identically-named, token-derived local, so a
+    #     real sixth cost-blind gate reads as `0 or 0` and goes UNSEEN.
+    owner, scope = {}, {}
+
+    def _descend(node, fname, binds):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                inner = _own_scope_assigns(child)
+                owner[id(child)] = child.name
+                scope[id(child)] = inner
+                _descend(child, child.name, inner)
+            else:
+                owner[id(child)] = fname
+                scope[id(child)] = binds
+                _descend(child, fname, binds)
+
+    # ONE scoping rule for every scope, module included: a two-rule census is
+    # how the nested-scope leak survived its own fix comment.
+    _descend(tree, "<module>", _own_scope_assigns(tree))
+    found: dict = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        binds = scope.get(id(node), {})
+        tnames = _both_views(node.test, binds)
+        bnames: set = set()
+        for st in node.body:
+            bnames |= _both_views(st, binds)
+        # the guarded body must write/accumulate a cost
+        if not any("cost" in n for n in bnames):
+            continue
+        keys_on_tokens = (any("input_token" in n for n in tnames)
+                          and any("output_token" in n for n in tnames))
+        uses_predicate = "turn_has_spend" in tnames
+        if not (keys_on_tokens or uses_predicate):
+            continue
+        # F1's cache-aware conversation guards are a DIFFERENT class
+        if any(t in n for n in tnames for t in _CACHE_AWARE_TERMS):
+            continue
+        # a LIST, not an assignment: two gates in ONE function must not
+        # collapse to a single key (round 4's mutant M5 found that hole)
+        key = (rel, owner.get(id(node), "<module>"))
+        found.setdefault(key, []).append({
+            "lineno": node.lineno,
+            "uses_predicate": uses_predicate,
+            "consults_cost": any("cost" in n for n in tnames),
+        })
+    return found
 
 
 def _ledger_gates():
@@ -815,81 +1009,198 @@ def _ledger_gates():
             # either way the file's text must contain one of these.
             if "token" not in text and "turn_has_spend" not in text:
                 continue
-            try:
-                tree = ast.parse(text)
-            except SyntaxError:
-                continue
-            # INNERMOST-function scoping, both for the sink key and for the
-            # inlining bindings. A flat ast.walk leaks a NESTED function's
-            # assignments into the enclosing one, and that is not academic:
-            # finding_verifier's `_usage_dict` assigns
-            # `usage = {"input_tokens": ..., "cost_usd": ...}`, which made the
-            # sibling callback's bare `if usage:` presence check inline into a
-            # dict naming both token kinds and cost — a false sixth member of
-            # this class. (My own first draft of this pin reported exactly
-            # that, which is how the blind spot was found.)
-            owner, scope = {}, {}
-
-            def _descend(node, fname, binds):
-                for child in ast.iter_child_nodes(node):
-                    if isinstance(child, (ast.FunctionDef,
-                                          ast.AsyncFunctionDef)):
-                        inner: dict = {}
-                        for gc in ast.walk(child):
-                            if (isinstance(gc, ast.Assign)
-                                    and len(gc.targets) == 1
-                                    and isinstance(gc.targets[0], ast.Name)):
-                                inner.setdefault(gc.targets[0].id, gc.value)
-                        owner[id(child)] = child.name
-                        scope[id(child)] = inner
-                        _descend(child, child.name, inner)
-                    else:
-                        owner[id(child)] = fname
-                        scope[id(child)] = binds
-                        _descend(child, fname, binds)
-
-            _module_binds: dict = {}
-            for gc in ast.iter_child_nodes(tree):
-                if (isinstance(gc, ast.Assign) and len(gc.targets) == 1
-                        and isinstance(gc.targets[0], ast.Name)):
-                    _module_binds.setdefault(gc.targets[0].id, gc.value)
-            _descend(tree, "<module>", _module_binds)
-            for node in ast.walk(tree):
-                if not isinstance(node, ast.If):
-                    continue
-                binds = scope.get(id(node), {})
-                tnames = _both_views(node.test, binds)
-                bnames: set = set()
-                for st in node.body:
-                    bnames |= _both_views(st, binds)
-                # the guarded body must write/accumulate a cost
-                if not any("cost" in n for n in bnames):
-                    continue
-                keys_on_tokens = (any("input_token" in n for n in tnames)
-                                  and any("output_token" in n for n in tnames))
-                uses_predicate = "turn_has_spend" in tnames
-                if not (keys_on_tokens or uses_predicate):
-                    continue
-                # F1's cache-aware conversation guards are a DIFFERENT class
-                if any(t in n for n in tnames for t in _CACHE_AWARE_TERMS):
-                    continue
-                # a LIST, not an assignment: two gates in ONE function must
-                # not collapse to a single key (round 4's mutant M5 found
-                # exactly that hole)
-                # as_posix(), not str(): str() yields backslashes on Windows
-                # and every key misses _EXPECTED (the windows-latest leg of
-                # CI caught that in round 4)
-                key = (path.relative_to(_REPO_ROOT).as_posix(),
-                       owner.get(id(node), "<module>"))
-                found.setdefault(key, []).append({
-                    "lineno": node.lineno,
-                    "uses_predicate": uses_predicate,
-                    "consults_cost": any("cost" in n for n in tnames),
-                })
+            # as_posix(), not str(): str() yields backslashes on Windows and
+            # every key misses _EXPECTED (round 4's windows-latest leg caught
+            # exactly that)
+            rel = path.relative_to(_REPO_ROOT).as_posix()
+            for key, sites in _gates_in_source(rel, text).items():
+                found.setdefault(key, []).extend(sites)
     # memoized: three tests below ask the same question of an unchanging
     # tree, and the walk is the whole cost of this file.
     _LEDGER_GATE_CACHE.append(found)
     return found
+
+
+#: a sixth cost-bearing ledger write gate, cost-blind, whose two token
+#: locals are RENAMED intermediates -- so seeing it depends on the census
+#: resolving the rename, which is what the scope defect broke.
+_SRC_SIXTH_GATE = """
+def _ledger_phase(units, sink):
+    for _u in units:
+        _p_in = _u.get("input_tokens", 0)
+        _p_out = _u.get("output_tokens", 0)
+        if _p_in or _p_out:
+            sink["cost_usd"] = _u.get("cost_usd", 0.0)
+"""
+
+#: THE SHADOWED-LOOP SHAPE: the identical gate, plus a nested helper that
+#: happens to use the same two local names for a zero-valued purpose.
+_SRC_SIXTH_GATE_SHADOWED = """
+def _ledger_phase(units, sink):
+
+    def _fmt():
+        _p_in = 0
+        _p_out = 0
+        return "%s/%s" % (_p_in, _p_out)
+
+    for _u in units:
+        _p_in = _u.get("input_tokens", 0)
+        _p_out = _u.get("output_tokens", 0)
+        if _p_in or _p_out:
+            sink["cost_usd"] = _u.get("cost_usd", 0.0)
+    return _fmt()
+"""
+
+#: the sink-key-collision form: a correctly-routed gate AND a shadowed
+#: cost-blind one in the SAME function (round 4's mutant-M5 hole, now with
+#: the nested helper on top).
+_SRC_SECOND_GATE_SHADOWED = """
+from utilities.llm_client import turn_has_spend
+
+
+def verify_batch(units, sink):
+    _in = 0
+    _out = 0
+    _cost = 0.0
+    if turn_has_spend(input_tokens=_in, output_tokens=_out, cost_usd=_cost):
+        sink["cost_usd"] = _cost
+
+    def _fmt():
+        _p_in = 0
+        _p_out = 0
+        return (_p_in, _p_out)
+
+    for _u in units:
+        _p_in = _u.get("input_tokens", 0)
+        _p_out = _u.get("output_tokens", 0)
+        if _p_in or _p_out:
+            sink["extra_cost_usd"] = _u.get("cost_usd", 0.0)
+    _fmt()
+"""
+
+#: the OTHER direction: a BARE presence check on a name this scope never
+#: assigns. finding_verifier's real shape (`_usage_dict` + `if usage:`).
+_SRC_BARE_PRESENCE_CHECK = """
+def verify_batch(sink):
+
+    def _usage_dict():
+        usage = {"input_tokens": 1, "output_tokens": 2, "cost_usd": 0.5}
+        return usage
+
+    for usage in (_usage_dict(),):
+        if usage:
+            sink["cost_usd"] = 1.0
+"""
+
+#: ... and its control: the same dict, assigned IN the gate's own scope, IS a
+#: member. The scope fix must narrow the inliner, not blind it.
+_SRC_IN_SCOPE_DICT = """
+def verify_batch(sink):
+    usage = {"input_tokens": 1, "output_tokens": 2, "cost_usd": 0.5}
+    if usage:
+        sink["cost_usd"] = 1.0
+"""
+
+#: a gate that lives INSIDE a nested function: it belongs to the nested
+#: function, not to its parent.
+_SRC_NESTED_GATE = """
+def enhance_dataset_agentic(sink):
+
+    def _summary_callback(usage=None):
+        _p_in = usage.get("input_tokens", 0)
+        _p_out = usage.get("output_tokens", 0)
+        if _p_in or _p_out:
+            sink["cost_usd"] = usage.get("cost_usd", 0.0)
+
+    return _summary_callback
+"""
+
+
+class TestTheCensusScopesItsBindingsToTheInnermostFunction:
+    """The census pin's own scoping promise, pinned — BOTH directions.
+
+    N1 of the non-author verify wave, against MY OWN round-5 code. The census
+    promises innermost-function scoping for its inlining bindings and then
+    collected them with a flat ``ast.walk``, which crosses INTO nested
+    functions. Two failures follow from the one defect, and the whole-tree
+    assertions above can see neither, because today's tree happens to contain
+    no instance:
+
+    * MASKING — BFS order plus ``setdefault`` means a nested helper's
+      zero-valued local WINS over the enclosing ledger loop's identically
+      named, token-derived local. The gate's test then resolves to ``0 or 0``,
+      the token keys vanish, and a real sixth cost-blind gate is INVISIBLE.
+      Measured: the SHADOWED-LOOP forms of mutants M8 and M9 (M8/M9 plus one
+      nested helper, nothing else) both SURVIVED at d0637b45 —
+      ``found=5 assertions_failed=0`` where the unshadowed originals give
+      ``found=6 assertions_failed=3``.
+    * PHANTOM — the mirror, and the one the pin's own comment claimed to have
+      fixed: a nested helper's usage dict inlines into a BARE presence check
+      the enclosing scope never bound, manufacturing a sixth member out of a
+      non-member. Measured: ``found=6``, 2 census assertions failed, with no
+      cost-blind gate anywhere in the tree.
+
+    These run on synthetic sources rather than on the tree, on purpose: a pin
+    whose only input is the tree can only pin what the tree already contains.
+    """
+
+    def test_a_nested_helper_must_not_hide_a_real_sixth_gate(self):
+        key = ("x.py", "_ledger_phase")
+        # fixture check: the gate is detectable AT ALL (the rename resolves)
+        control = _gates_in_source("x.py", _SRC_SIXTH_GATE)
+        assert list(control) == [key], (
+            f"fixture check failed, the plain form is not seen: {control}")
+
+        found = _gates_in_source("x.py", _SRC_SIXTH_GATE_SHADOWED)
+        assert list(found) == [key], (
+            "a sixth cost-blind ledger write gate became INVISIBLE to this "
+            "census because a nested helper in the same function reuses its "
+            "two local names for zero-valued work. The bindings used to "
+            "resolve a renamed token intermediate must come from the gate's "
+            "OWN scope only — a nested function is a different namespace. "
+            f"found: {found}")
+        assert len(found[key]) == 1, found
+        assert found[key][0]["uses_predicate"] is False
+        assert found[key][0]["consults_cost"] is False
+
+    def test_a_shadowed_second_gate_in_a_counted_function_still_counts(self):
+        """The sink-key-collision direction: the shadowed gate must not hide
+        behind its correctly-routed sibling in the same function."""
+        key = ("y.py", "verify_batch")
+        found = _gates_in_source("y.py", _SRC_SECOND_GATE_SHADOWED)
+        assert list(found) == [key], found
+        assert len(found[key]) == 2, (
+            "two gates in one function must stay two sites; the shadowed "
+            f"cost-blind one was dropped: {found}")
+        blind = [s for s in found[key] if not s["uses_predicate"]
+                 and not s["consults_cost"]]
+        assert len(blind) == 1, found
+
+    def test_a_nested_helpers_dict_must_not_fabricate_a_member(self):
+        """The PHANTOM direction, with its own control."""
+        phantom = _gates_in_source("z.py", _SRC_BARE_PRESENCE_CHECK)
+        assert phantom == {}, (
+            "a BARE presence check became a member of the cost-bearing "
+            "ledger-gate class: the census inlined a NESTED helper's usage "
+            "dict into a name the gate's own scope never assigns. That is a "
+            "false positive on a real module shape "
+            "(finding_verifier.py:855 `_usage_dict` + :904 `if usage:`), and "
+            f"it would fail the closure assertions for nothing. found: "
+            f"{phantom}")
+        # the control: narrowing the scope must not blind the inliner
+        in_scope = _gates_in_source("z.py", _SRC_IN_SCOPE_DICT)
+        assert list(in_scope) == [("z.py", "verify_batch")], (
+            "the same dict, bound in the gate's OWN scope, must still "
+            f"resolve — the fix narrows the scope, it does not remove the "
+            f"rename resolution: {in_scope}")
+
+    def test_a_gate_inside_a_nested_function_is_keyed_to_that_function(self):
+        """The attribution half of the same promise. Green before this fix
+        too — it is the regression guard on the sink KEY while the binding
+        scope changes underneath it."""
+        found = _gates_in_source("w.py", _SRC_NESTED_GATE)
+        assert list(found) == [("w.py", "_summary_callback")], found
+        assert ("w.py", "enhance_dataset_agentic") not in found
 
 
 class TestTheLedgerGateClassIsClosed:

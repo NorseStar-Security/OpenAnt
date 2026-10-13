@@ -450,10 +450,14 @@ def turn_has_spend(usage=None, *, input_tokens=None, output_tokens=None,
     on a no-spend phase still writing NO usage block and injecting nothing, so
     a clean run's checkpoint stays byte-identical to the pre-#598 shape.
 
-    Never raises. Every caller also reads LEGACY checkpoints, two of them on
-    worker threads, and three of these gates previously tested bare
-    truthiness — so a malformed payload that used to read falsy (``[]``) must
-    not start raising inside the gate.
+    Never raises for any value a JSON decode can produce. Every caller also
+    reads LEGACY checkpoints, two of them on worker threads, and three of
+    these gates previously tested bare truthiness — so a malformed payload
+    that used to read falsy (``[]``) must not start raising inside the gate.
+    The promise is stated against the DECODER rather than loosely, because the
+    first version of it was not true: a JSON integer is unbounded and a float
+    is not, so a 10**400 token count raised OverflowError out of the gate
+    where the bare truthiness test it replaced had restored the spend.
     """
     src = usage if isinstance(usage, dict) else {}
     if input_tokens is None:
@@ -472,9 +476,18 @@ def turn_has_spend(usage=None, *, input_tokens=None, output_tokens=None,
     def _num(value) -> float:
         try:
             return float(value or 0)
-        except (TypeError, ValueError):
-            # a malformed legacy payload: fall back to truthiness rather than
-            # raise inside a gate that previously only tested truthiness
+        except (TypeError, ValueError, OverflowError):
+            # Fall back to TRUTHINESS rather than raise inside a gate that
+            # previously only tested truthiness. Two distinct payloads land
+            # here and the fallback is right for both:
+            #   * a malformed legacy value (a list, a non-numeric string);
+            #   * OverflowError -- a Python int is unbounded and a float is
+            #     not, so a JSON-decoded count of 10**400 cannot be converted
+            #     at all. It is still SPEND: treating it as no-spend would
+            #     orphan the dollars beside it, which is this round's defect.
+            # Note the asymmetry this preserves on purpose: the string "0"
+            # parses to 0.0 above and stays a SKIP (#609's all-zero skip on a
+            # stringly-typed legacy field), while "abc" reads as spend here.
             return 1.0 if value else 0.0
 
     return bool(_num(input_tokens) or _num(output_tokens) or _num(cost_usd)
