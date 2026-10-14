@@ -42,7 +42,7 @@ var uiVendorScripts = []struct {
 	banner string
 }{
 	{"marked-18.1.1.min.js", "b82b9334406d8bdd16b6236c08de1cb65b2a859873ca9503d9cc0b292ca3c12a", "marked v"},
-	{"dompurify-3.4.15.min.js", "f263b05369e050fa175d4ecb9c9358eb4253602d510297adfb31df48b2f1c4d5", "DOMPurify "},
+	{"dompurify-3.4.17.min.js", "f263b05369e050fa175d4ecb9c9358eb4253602d510297adfb31df48b2f1c4d5", "DOMPurify "},
 }
 
 const uiVendorMinBytes = 10_000
